@@ -11,10 +11,11 @@ import (
 	"time"
 
 	log "github.com/golang/glog"
+	zookeeper "github.com/samuel/go-zookeeper/zk"
+
 	"github.com/youtube/vitess/go/vt/servenv"
 	"github.com/youtube/vitess/go/vt/tabletserver"
 	"github.com/youtube/vitess/go/zk"
-	"launchpad.net/gozk/zookeeper"
 )
 
 var (
@@ -24,10 +25,10 @@ var (
 	zkRulePath = flag.String("zkcustomrules", "", "zookeeper based custom rule path")
 )
 
-// Invalid rule version, used to mark invalid query rules
+// InvalidQueryRulesVersion is used to mark invalid query rules
 const InvalidQueryRulesVersion int64 = -1
 
-// Zookeeper based custom rule source name
+// ZkCustomRuleSource is zookeeper based custom rule source name
 const ZkCustomRuleSource string = "ZK_CUSTOM_RULE"
 
 // ZkCustomRule is Zookeeper backed implementation of CustomRuleManager
@@ -51,7 +52,7 @@ func NewZkCustomRule(zkconn zk.Conn) *ZkCustomRule {
 }
 
 // Open Registers Zookeeper watch, gets inital QueryRules and starts polling routine
-func (zkcr *ZkCustomRule) Open(qsc tabletserver.QueryServiceControl, rulePath string) (err error) {
+func (zkcr *ZkCustomRule) Open(qsc tabletserver.Controller, rulePath string) (err error) {
 	zkcr.path = rulePath
 	err = zkcr.refreshWatch()
 	if err != nil {
@@ -78,8 +79,8 @@ func (zkcr *ZkCustomRule) refreshWatch() error {
 }
 
 // refreshData gets query rules from Zookeeper and refresh internal QueryRules cache
-// this function will also call SqlQuery.SetQueryRules to propagate rule changes to query service
-func (zkcr *ZkCustomRule) refreshData(qsc tabletserver.QueryServiceControl, nodeRemoval bool) error {
+// this function will also call TabletServer.SetQueryRules to propagate rule changes to query service
+func (zkcr *ZkCustomRule) refreshData(qsc tabletserver.Controller, nodeRemoval bool) error {
 	data, stat, err := zkcr.zconn.Get(zkcr.path)
 	zkcr.mu.Lock()
 	defer zkcr.mu.Unlock()
@@ -92,7 +93,7 @@ func (zkcr *ZkCustomRule) refreshData(qsc tabletserver.QueryServiceControl, node
 				return nil
 			}
 		}
-		zkcr.currentRuleSetVersion = stat.Mzxid()
+		zkcr.currentRuleSetVersion = stat.Mzxid
 		if !reflect.DeepEqual(zkcr.currentRuleSet, qrs) {
 			zkcr.currentRuleSet = qrs.Copy()
 			qsc.SetQueryRules(ZkCustomRuleSource, qrs.Copy())
@@ -108,20 +109,20 @@ const sleepDuringZkFailure time.Duration = 30
 
 // poll polls the Zookeeper watch channel for data changes and refresh watch channel if watch channel is closed
 // by Zookeeper Go library on error conditions such as connection reset
-func (zkcr *ZkCustomRule) poll(qsc tabletserver.QueryServiceControl) {
+func (zkcr *ZkCustomRule) poll(qsc tabletserver.Controller) {
 	for {
 		select {
 		case <-zkcr.finish:
 			return
 		case event := <-zkcr.watch:
 			switch event.Type {
-			case zookeeper.EVENT_CREATED, zookeeper.EVENT_CHANGED, zookeeper.EVENT_DELETED:
-				err := zkcr.refreshData(qsc, event.Type == zookeeper.EVENT_DELETED) // refresh rules
+			case zookeeper.EventNodeCreated, zookeeper.EventNodeDataChanged, zookeeper.EventNodeDeleted:
+				err := zkcr.refreshData(qsc, event.Type == zookeeper.EventNodeDeleted) // refresh rules
 				if err != nil {
 					// Sleep to avoid busy waiting during connection re-establishment
 					<-time.After(time.Second * sleepDuringZkFailure)
 				}
-			case zookeeper.EVENT_CLOSED:
+			case zookeeper.EventSession:
 				err := zkcr.refreshWatch() // need to to get a new watch
 				if err != nil {
 					// Sleep to avoid busy waiting during connection re-establishment
@@ -147,14 +148,14 @@ func (zkcr *ZkCustomRule) GetRules() (qrs *tabletserver.QueryRules, version int6
 }
 
 // ActivateZkCustomRules activates zookeeper dynamic custom rule mechanism
-func ActivateZkCustomRules(qsc tabletserver.QueryServiceControl) {
+func ActivateZkCustomRules(qsc tabletserver.Controller) {
 	if *zkRulePath != "" {
-		tabletserver.QueryRuleSources.RegisterQueryRuleSource(ZkCustomRuleSource)
+		qsc.RegisterQueryRuleSource(ZkCustomRuleSource)
 		zkCustomRule.Open(qsc, *zkRulePath)
 	}
 }
 
 func init() {
-	tabletserver.QueryServiceControlRegisterFunctions = append(tabletserver.QueryServiceControlRegisterFunctions, ActivateZkCustomRules)
+	tabletserver.RegisterFunctions = append(tabletserver.RegisterFunctions, ActivateZkCustomRules)
 	servenv.OnTerm(zkCustomRule.Close)
 }

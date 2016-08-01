@@ -1,125 +1,215 @@
-# Concepts
-We need to introduce some common terminologies that are used in Vitess:
-### Keyspace
-A keyspace is a logical database.
-In its simplest form, it directly maps to a MySQL database name.
-When you read data from a keyspace, it is as if you read from a MySQL database.
-Vitess could fetch that data from a master or a replica depending
-on the consistency requirements of the read.
+This document defines common Vitess concepts and terminology.
 
-When a database gets [sharded](http://en.wikipedia.org/wiki/Shard_(database_architecture)),
-a keyspace maps to multiple MySQL databases,
-and the necessary data is fetched from one of the shards.
-Reading from a keyspace gives you the impression that the data is read from
-a single MySQL database.
+## Keyspace
 
-### Shard
+A *keyspace* is a logical database. In the unsharded case, it maps directly
+to a MySQL database name, but it can also map to multiple MySQL databases.
 
-A division within a Keyspace. All the instances inside a Shard have the same data (or should have the same data,
-modulo some replication lag).
+Reading data from a keyspace is like reading from a MySQL database. However,
+depending on the consistency requirements of the read operation, Vitess
+might fetch the data from a master database or from a replica. By routing
+each query to the appropriate database, Vitess allows your code to be
+structured as if it were reading from a single MySQL database.
 
-A Keyspace usually has one shard when not using any sharding (we name it '0' by convention). When sharded, a Keyspace will have N shards (usually, N is a power of 2) with non-overlapping data.
+When a database is
+[sharded](http://en.wikipedia.org/wiki/Shard_(database_architecture)),
+a keyspace maps to multiple MySQL databases. In that case, a single query sent
+to Vitess will be routed to one or more shards, depending on where the requested
+data resides.
 
-We support [dynamic resharding](Resharding.md), when one shard is split into two shards for instance. In this case, the data in the
-source shard is duplicated into the two destination shards, but only during the transition. Afterwards, the source shard is
+## Keyspace ID
+
+The *keyspace ID* is the value that is used to decide on which shard a given
+record lives. [Range-based Sharding](http://vitess.io/user-guide/sharding.html#range-based-sharding)
+refers to creating shards that each cover a particular range of keyspace IDs.
+
+Often, the keyspace ID is computed as the hash of some column in your data,
+such as the user ID. This would result in randomly spreading users across
+the range-based shards.
+Using this technique means you can split a given shard by replacing it with two
+or more new shards that combine to cover the original range of keyspace IDs,
+without having to move any records in other shards.
+
+Previously, our resharding process required each table to store this value as a
+`keyspace_id` column because it was computed by the application. However, this
+column is no longer necessary when you allow VTGate to compute the keyspace ID
+for you, for example by using a `hash` vindex.
+
+## Shard
+
+A *shard* is a division within a keyspace. A shard typically contains one MySQL
+master and many MySQL slaves.
+
+Each MySQL instance within a shard has the same data (excepting some replication
+lag). The slaves can serve read-only traffic (with eventual consistency guarantees),
+execute long-running data analysis tools, or perform administrative tasks
+(backup, restore, diff, etc.).
+
+A keyspace that does not use sharding effectively has one shard.
+Vitess names the shard `0` by convention. When sharded, a keyspace has `N`
+shards with non-overlapping data.
+
+### Resharding
+
+Vitess supports [dynamic resharding](http://vitess.io/user-guide/sharding.html#resharding),
+in which the number of shards is changed on a live cluster. This can be either
+splitting one or more shards into smaller pieces, or merging neighboring shards
+into bigger pieces.
+
+During dynamic resharding, the data in the source shards is copied into the
+destination shards, allowed to catch up on replication, and then compared
+against the original to ensure data integrity. Then the live serving
+infrastructure is shifted to the destination shards, and the source shards are
 deleted.
 
-A shard usually contains one MySQL master, and many MySQL slaves. The slaves are used to serve read-only traffic (with
-eventual consistency guarantees), run data analysis tools that take a long time to run, or perform administrative tasks (backups, restore, diffs, ...)
+## Tablet
 
-### Tablet
+A *tablet* is a combination of a `mysqld` process and a corresponding `vttablet`
+process, usually running on the same machine.
 
-A tablet is a single server that runs:
-- a MySQL instance
-- a vttablet instance
-- a local row cache instance
-- an other per-db process that is necessary for operational purposes
+Each tablet is assigned a *tablet type*, which specifies what role it currently
+performs.
 
-It can be idle (not assigned to any keyspace), or assigned to a keyspace/shard. If it becomes unhealthy, it is usually changed to scrap.
+### Tablet Types
 
-It has a type. The commonly used types are:
-- master: for the mysql master, RW database.
-- replica: for a mysql slave that serves read-only traffic, with guaranteed low replication latency.
-- rdonly: for a mysql slave that serves read-only traffic for backend processing jobs (like map-reduce type jobs). It has no real guaranteed replication latency.
-- spare: for a mysql slave not used at the moment (hot spare).
-- experimental, schema, lag, backup, restore, checker, ... : various types for specific purposes.
+* **master** - A *replica* tablet that happens to currently be the MySQL master
+             for its shard.
+* **replica** - A MySQL slave that is eligible to be promoted to *master*.
+              Conventionally, these are reserved for serving live, user-facing
+              requests (like from the website's frontend).
+* **rdonly** - A MySQL slave that cannot be promoted to *master*.
+             Conventionally, these are used for background processing jobs,
+             such as taking backups, dumping data to other systems, heavy
+             analytical queries, MapReduce, and resharding.
+* **backup** - A tablet that has stopped replication at a consistent snapshot,
+             so it can upload a new backup for its shard. After it finishes,
+             it will resume replication and return to its previous type.
+* **restore** - A tablet that has started up with no data, and is in the process
+              of restoring itself from the latest backup. After it finishes,
+              it will begin replicating at the GTID position of the backup,
+              and become either *replica* or *rdonly*.
+* **worker** - A *rdonly* tablet that has been reserved by a Vitess background
+             process (such as resharding). While it is a *worker* type, the
+             tablet will not be available to serve queries from Vitess clients.
+             After the background job finishes, the tablet will resume
+             replication (if necessary) and go back to being *rdonly*.
 
-Only master, replica and rdonly are advertised in the Serving Graph.
+<div style="display:none">
+TODO: Add pointer to complete list of types and explain how to update type?
+</div>
 
-### Keyspace id
-A keyspace id (keyspace_id) is a column that is used to identify a primary entity
-of a keyspace, like user, video, order, etc.
-In order to shard a database, all tables in a keyspace need to
-contain a keyspace id column.
-Vitess sharding ensures that all rows that have a common keyspace id are
-always together.
+## Keyspace Graph
 
-It's recommended, but not necessary, that the keyspace id be the leading primary
-key column of all tables in a keyspace.
+The *keyspace graph* allows Vitess to decide which set of shards to use for a
+given keyspace, cell, and tablet type.
 
-If you do not intend to shard a database, you do not have to
-designate a keyspace_id.
-However, you'll be required to designate a keyspace_id
-if you decide to shard a currently unsharded database.
+### Partitions
 
-A keyspace_id can be an unsigned number or a binary character column (unsigned bigint
-or varbinary in mysql tables). Other data types are not allowed because of ambiguous
-equality or inequality rules.
+During horizontal resharding (splitting or merging shards), there can be shards
+with overlapping key ranges. For example, the source shard of a split may serve
+`c0-d0` while its destination shards serve `c0-c8` and `c8-d0` respectively.
 
-TODO: The keyspace id rules need to be solidified once VTGate features are finalized.
+Since these shards need to exist simultaneously during the migration,
+the keyspace graph maintains a list (called a *partitioning* or just a *partition*)
+of shards whose ranges cover all possible keyspace ID values, while being
+non-overlapping and contiguous. Shards can be moved in and out of this list to
+determine whether they are active.
 
-### Shard graph
-The shard graph defines how a keyspace has been sharded. It's basically a per-keyspace
-list of non-intersecting ranges that cover all possible values a keyspace id can cover.
-In other words, any given keyspace id is guaranteed to map to one and only one
-shard of the shard graph.
+The keyspace graph stores a separate partitioning for each `(cell, tablet type)` pair.
+This allows migrations to proceed in phases: first migrate *rdonly* and
+*replica* requests, one cell at a time, and finally migrate *master* requests.
 
-We are going with range based sharding.
-The main advantage of this scheme is that the shard map is a simple in-memory lookup.
-The downside of this scheme is that it creates hot-spots for sequentially increasing keys.
-In such cases, we recommend that the application hashes the keys so they
-distribute more randomly.
+### Served From
 
-For instance, an application may use an incrementing UserId as a primary key for user records,
-and a hashed version of that UserId as a keyspace_id. All data related to one user will be on
-the same shard, as all rows will share that keyspace_id.
+During vertical resharding (moving tables out from one keyspace to form a new
+keyspace), there can be multiple keyspaces that contain the same table.
 
-### Replication graph
-The Replication Graph represents the relationships between the master
-databases and their respective replicas.
-This data is particularly useful during a master failover.
-Once a new master has been designated, all existing replicas have to
-be repointed to the new master so that replication can resume.
+Since these multiple copies of the table need to exist simultaneously during
+the migration, the keyspace graph supports keyspace redirects, called
+`ServedFrom` records. That enables a migration flow like this:
 
-### Serving graph
-The Serving Graph is derived from the shard and replication graph.
-It represents the list of active servers that are available to serve
-queries.
-VTGate (or smart clients) query the serving graph to find out which servers
-they are allowed to send queries to.
+1.  Create `new_keyspace` and set its `ServedFrom` to point to `old_keyspace`.
+1.  Update the app to look for the tables to be moved in `new_keyspace`.
+    Vitess will automatically redirect these requests to `old_keyspace`.
+1.  Perform a vertical split clone to copy data to the new keyspace and start
+    filtered replication.
+1.  Remove the `ServedFrom` redirect to begin actually serving from `new_keyspace`.
+1.  Drop the now unused copies of the tables from `old_keyspace`.
 
-### Topology Service
-The [Topology Service](TopologyService.md) is the backend service used to store the Topology data, and provide a locking service. It is backed by a Topology Server, and we support both ZooKeeper and etcd for that.
+There can be a different `ServedFrom` record for each `(cell, tablet type)` pair.
+This allows migrations to proceed in phases: first migrate *rdonly* and
+*replica* requests, one cell at a time, and finally migrate *master* requests.
 
-There is a global instance of that service. It contains data that doesn't change often, and references other local instances. It may be replicated locally in each Data Center as read-only copies. (a Zookeeper instance with two master instances per cell and one or two replicas per cell is a good configuration).
+## Replication Graph
 
-There is one local instance of that service per Cell (Data Center). The goal is to transparently support a Cell going down. When that happens, we assume the client traffic is drained out of that Cell, and the system can survive
-using the remaining Cells. (a Zookeeper instance running on 3 or 5 hosts locally is a good configuration).
+The *replication graph* identifies the relationships between master
+databases and their respective replicas. During a master failover,
+the replication graph enables Vitess to point all existing replicas
+to a newly designated master database so that replication can continue.
 
-The data is partitioned as follows:
-- Keyspaces: global instance
-- Shards: global instance
-- Tablets: local instances
-- Serving Graph: local instances
-- Replication Graph: the master alias is in the global instance, the master-slave map is in the local cells.
+## Topology Service
 
-Clients are designed to just read the local Serving Graph, therefore they only need the local instance to be up.
+The *[Topology Service](https://github.com/youtube/vitess/blob/master/doc/TopologyService.md)*
+is a set of backend processes running on different servers.
+Those servers store topology data and provide a distributed locking service.
 
-### Cell (Data Center)
+Vitess uses a plug-in system to support various backends for storing topology
+data, which are assumed to provide a distributed, consistent key-value store.
+By default, our [local example](http://vitess.io/getting-started/local-instance.html)
+uses the ZooKeeper plugin, and the [Kubernetes example](http://vitess.io/getting-started/)
+uses etcd.
 
-A Cell is a group of servers and network infrastructure collocated in an area. It is usually a full Data Center, or a subset of a full Data Center.
+The topology service exists for several reasons:
 
-A Cell has an associated Topology Server, hosted in that Cell. Most information about the tablets in a cell is hosted in that cell's Topology Server. That way a Cell can be taken down and rebuilt as a unit, for instance.
+* It enables tablets to coordinate among themselves as a cluster.
+* It enables Vitess to discover tablets, so it knows where to route queries.
+* It stores Vitess configuration provided by the database administrator that is
+  needed by many different servers in the cluster, and that must persist between
+  server restarts.
 
-We try to limit cross-cell traffic (both for data and metadata), and gracefully handle cell-level failures (like a Cell being cut off the network). Having the ability to route client traffic to Cells individually is a great feature to have
-(but not provided by the Vitess software).
+A Vitess cluster has one global topology service, and a local topology service
+in each cell. Since *cluster* is an overloaded term, and one Vitess cluster is
+distinguished from another by the fact that each has its own global topology
+service, we refer to each Vitess cluster as a **toposphere**.
+
+### Global Topology
+
+The global topology stores Vitess-wide data that does not change frequently.
+Specifically, it contains data about keyspaces and shards as well as the
+master tablet alias for each shard.
+
+The global topology is used for some operations, including reparenting and
+resharding. By design, the global topology server is not used a lot.
+
+In order to survive any single cell going down, the global topology service
+should have nodes in multiple cells, with enough to maintain quorum in the
+event of a cell failure.
+
+### Local Topology
+
+Each local topology contains information related to its own cell.
+Specifically, it contains data about tablets in the cell, the keyspace graph
+for that cell, and the replication graph for that cell.
+
+The local topology service must be available for Vitess to discover tablets
+and adjust routing as tablets come and go. However, no calls to the topology
+service are made in the critical path of serving a query at steady state.
+That means queries are still served during temporary unavailability of topology.
+
+## Cell (Data Center)
+
+A *cell* is a group of servers and network infrastructure collocated in an area,
+and isolated from failures in other cells. It is typically either a full data
+center or a subset of a data center, sometimes called a *zone* or *availability zone*.
+Vitess gracefully handles cell-level failures, such as when a cell is cut off the network.
+
+Each cell in a Vitess implementation has a [local topology service](#topology-service),
+which is hosted in that cell. The topology service contains most of the
+information about the Vitess tablets in its cell.
+This enables a cell to be taken down and rebuilt as a unit.
+
+Vitess limits cross-cell traffic for both data and metadata.
+While it may be useful to also have the ability to route read traffic to
+individual cells, Vitess currently serves reads only from the local cell.
+Writes will go cross-cell when necessary, to wherever the master for that shard
+resides.

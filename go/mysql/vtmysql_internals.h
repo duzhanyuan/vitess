@@ -15,10 +15,27 @@
 
 // These low-level vio functions are not declared
 // anywhere in the libmysqlclient headers.
+#if MYSQL_VERSION_ID >= 100000 // MariaDB 10.0+
+// MariaDB has a function vio_socket_shutdown that does what we want.
 int vio_socket_shutdown(Vio *vio, int how);
+#else
+// MySQL 5.6 doesn't have a vio function that just calls shutdown without also
+// closing the socket. So we use the system-level shutdown() call, and ask Vio
+// to just give us the FD.
+my_socket vio_fd(Vio* vio);
+#include <sys/socket.h>
+#define vio_socket_shutdown(vio, how) shutdown(vio_fd(vio), how)
+#endif
 
-// cli_safe_read is declared in sql_common.h.
+// cli_safe_read is declared in sql_common.h, which we can't assume
+// we have, so we declare it manually.
+#if MYSQL_VERSION_ID >= 50700 && MYSQL_VERSION_ID < 100000
+// MySQL 5.7
+unsigned long cli_safe_read(MYSQL *mysql, my_bool *is_data_packet);
+#else
+// MySQL 5.6 and MariaDB
 unsigned long cli_safe_read(MYSQL *mysql);
+#endif // MYSQL_VERSION_ID >= 50700 && MYSQL_VERSION_ID < 100000
 
 // st_mysql_methods and simple_command are declared in mysql.h in
 // Google MySQL 5.1 (VERSION_ID=501xx), but were moved to sql_common.h in

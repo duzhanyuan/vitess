@@ -10,7 +10,6 @@ import (
 	"log/syslog"
 	"os"
 	"os/signal"
-	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -18,7 +17,7 @@ import (
 	log "github.com/golang/glog"
 	"github.com/youtube/vitess/go/exit"
 	"github.com/youtube/vitess/go/vt/logutil"
-	myproto "github.com/youtube/vitess/go/vt/mysqlctl/proto"
+	"github.com/youtube/vitess/go/vt/servenv"
 	"github.com/youtube/vitess/go/vt/tabletmanager/tmclient"
 	"github.com/youtube/vitess/go/vt/topo"
 	"github.com/youtube/vitess/go/vt/vtctl"
@@ -27,8 +26,7 @@ import (
 )
 
 var (
-	waitTime        = flag.Duration("wait-time", 24*time.Hour, "time to wait on an action")
-	lockWaitTimeout = flag.Duration("lock-wait-timeout", time.Minute, "time to wait for a lock before starting an action")
+	waitTime = flag.Duration("wait-time", 24*time.Hour, "time to wait on an action")
 )
 
 func init() {
@@ -74,11 +72,13 @@ func main() {
 		log.Warningf("cannot connect to syslog: %v", err)
 	}
 
+	servenv.FireRunHooks()
+
 	topoServer := topo.GetServer()
 	defer topo.CloseServers()
 
 	ctx, cancel := context.WithTimeout(context.Background(), *waitTime)
-	wr := wrangler.New(logutil.NewConsoleLogger(), topoServer, tmclient.NewTabletManagerClient(), *lockWaitTimeout)
+	wr := wrangler.New(logutil.NewConsoleLogger(), topoServer, tmclient.NewTabletManagerClient())
 	installSignalHandlers(cancel)
 
 	err := vtctl.RunCommand(ctx, wr, args)
@@ -93,53 +93,4 @@ func main() {
 		log.Errorf("action failed: %v %v", action, err)
 		exit.Return(255)
 	}
-}
-
-type rTablet struct {
-	*topo.TabletInfo
-	*myproto.ReplicationStatus
-}
-
-type rTablets []*rTablet
-
-func (rts rTablets) Len() int { return len(rts) }
-
-func (rts rTablets) Swap(i, j int) { rts[i], rts[j] = rts[j], rts[i] }
-
-// Sort for tablet replication.
-// master first, then i/o position, then sql position
-func (rts rTablets) Less(i, j int) bool {
-	// NOTE: Swap order of unpack to reverse sort
-	l, r := rts[j], rts[i]
-	// l or r ReplicationPosition would be nil if we failed to get
-	// the position (put them at the beginning of the list)
-	if l.ReplicationStatus == nil {
-		return r.ReplicationStatus != nil
-	}
-	if r.ReplicationStatus == nil {
-		return false
-	}
-	var lTypeMaster, rTypeMaster int
-	if l.Type == topo.TYPE_MASTER {
-		lTypeMaster = 1
-	}
-	if r.Type == topo.TYPE_MASTER {
-		rTypeMaster = 1
-	}
-	if lTypeMaster < rTypeMaster {
-		return true
-	}
-	if lTypeMaster == rTypeMaster {
-		return !l.Position.AtLeast(r.Position)
-	}
-	return false
-}
-
-func sortReplicatingTablets(tablets []*topo.TabletInfo, stats []*myproto.ReplicationStatus) []*rTablet {
-	rtablets := make([]*rTablet, len(tablets))
-	for i, status := range stats {
-		rtablets[i] = &rTablet{tablets[i], status}
-	}
-	sort.Sort(rTablets(rtablets))
-	return rtablets
 }

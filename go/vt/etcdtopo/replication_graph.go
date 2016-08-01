@@ -8,12 +8,14 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/youtube/vitess/go/jscfg"
 	"github.com/youtube/vitess/go/vt/topo"
+	"golang.org/x/net/context"
+
+	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
 )
 
 // UpdateShardReplicationFields implements topo.Server.
-func (s *Server) UpdateShardReplicationFields(cell, keyspace, shard string, updateFunc func(*topo.ShardReplication) error) error {
+func (s *Server) UpdateShardReplicationFields(ctx context.Context, cell, keyspace, shard string, updateFunc func(*topodatapb.ShardReplication) error) error {
 	var sri *topo.ShardReplicationInfo
 	var version int64
 	var err error
@@ -22,7 +24,7 @@ func (s *Server) UpdateShardReplicationFields(cell, keyspace, shard string, upda
 		if sri, version, err = s.getShardReplication(cell, keyspace, shard); err != nil {
 			if err == topo.ErrNoNode {
 				// Pass an empty struct to the update func, as specified in topo.Server.
-				sri = topo.NewShardReplicationInfo(&topo.ShardReplication{}, cell, keyspace, shard)
+				sri = topo.NewShardReplicationInfo(&topodatapb.ShardReplication{}, cell, keyspace, shard)
 				version = -1
 			} else {
 				return err
@@ -49,9 +51,13 @@ func (s *Server) updateShardReplication(sri *topo.ShardReplicationInfo, existing
 		return -1, err
 	}
 
-	data := jscfg.ToJson(sri.ShardReplication)
+	data, err := json.MarshalIndent(sri.ShardReplication, "", "  ")
+	if err != nil {
+		return -1, err
+	}
+
 	resp, err := cell.CompareAndSwap(shardReplicationFilePath(sri.Keyspace(), sri.Shard()),
-		data, 0 /* ttl */, "" /* prevValue */, uint64(existingVersion))
+		string(data), 0 /* ttl */, "" /* prevValue */, uint64(existingVersion))
 	if err != nil {
 		return -1, convertError(err)
 	}
@@ -68,9 +74,12 @@ func (s *Server) createShardReplication(sri *topo.ShardReplicationInfo) (int64, 
 		return -1, err
 	}
 
-	data := jscfg.ToJson(sri.ShardReplication)
+	data, err := json.MarshalIndent(sri.ShardReplication, "", "  ")
+	if err != nil {
+		return -1, err
+	}
 	resp, err := cell.Create(shardReplicationFilePath(sri.Keyspace(), sri.Shard()),
-		data, 0 /* ttl */)
+		string(data), 0 /* ttl */)
 	if err != nil {
 		return -1, convertError(err)
 	}
@@ -82,7 +91,7 @@ func (s *Server) createShardReplication(sri *topo.ShardReplicationInfo) (int64, 
 }
 
 // GetShardReplication implements topo.Server.
-func (s *Server) GetShardReplication(cell, keyspace, shard string) (*topo.ShardReplicationInfo, error) {
+func (s *Server) GetShardReplication(ctx context.Context, cell, keyspace, shard string) (*topo.ShardReplicationInfo, error) {
 	sri, _, err := s.getShardReplication(cell, keyspace, shard)
 	return sri, err
 }
@@ -101,7 +110,7 @@ func (s *Server) getShardReplication(cellName, keyspace, shard string) (*topo.Sh
 		return nil, -1, ErrBadResponse
 	}
 
-	value := &topo.ShardReplication{}
+	value := &topodatapb.ShardReplication{}
 	if err := json.Unmarshal([]byte(resp.Node.Value), value); err != nil {
 		return nil, -1, fmt.Errorf("bad shard replication data (%v): %q", err, resp.Node.Value)
 	}
@@ -110,12 +119,23 @@ func (s *Server) getShardReplication(cellName, keyspace, shard string) (*topo.Sh
 }
 
 // DeleteShardReplication implements topo.Server.
-func (s *Server) DeleteShardReplication(cellName, keyspace, shard string) error {
+func (s *Server) DeleteShardReplication(ctx context.Context, cellName, keyspace, shard string) error {
 	cell, err := s.getCell(cellName)
 	if err != nil {
 		return err
 	}
 
 	_, err = cell.Delete(shardReplicationDirPath(keyspace, shard), true /* recursive */)
+	return convertError(err)
+}
+
+// DeleteKeyspaceReplication implements topo.Server.
+func (s *Server) DeleteKeyspaceReplication(ctx context.Context, cellName, keyspace string) error {
+	cell, err := s.getCell(cellName)
+	if err != nil {
+		return err
+	}
+
+	_, err = cell.Delete(keyspaceReplicationDirPath(keyspace), true /* recursive */)
 	return convertError(err)
 }

@@ -5,11 +5,17 @@
 package etcdtopo
 
 import (
+	"path"
 	"testing"
+	"time"
+
+	"golang.org/x/net/context"
 
 	"github.com/youtube/vitess/go/flagutil"
+	"github.com/youtube/vitess/go/vt/topo"
 	"github.com/youtube/vitess/go/vt/topo/test"
-	"golang.org/x/net/context"
+
+	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
 )
 
 func newTestServer(t *testing.T, cells []string) *Server {
@@ -30,74 +36,66 @@ func newTestServer(t *testing.T, cells []string) *Server {
 	return s
 }
 
-func TestKeyspace(t *testing.T) {
-	ts := newTestServer(t, []string{"test"})
-	defer ts.Close()
-	test.CheckKeyspace(t, ts)
+func TestEtcdTopo(t *testing.T) {
+	test.TopoServerTestSuite(t, func() topo.Impl {
+		return newTestServer(t, []string{"test"})
+	})
 }
 
-func TestShard(t *testing.T) {
-	ts := newTestServer(t, []string{"test"})
-	defer ts.Close()
-	test.CheckShard(context.Background(), t, ts)
-}
-
-func TestTablet(t *testing.T) {
-	ts := newTestServer(t, []string{"test"})
-	defer ts.Close()
-	test.CheckTablet(context.Background(), t, ts)
-}
-
-func TestShardReplication(t *testing.T) {
-	ts := newTestServer(t, []string{"test"})
-	defer ts.Close()
-	test.CheckShardReplication(t, ts)
-}
-
-func TestServingGraph(t *testing.T) {
-	ts := newTestServer(t, []string{"test"})
-	defer ts.Close()
-	test.CheckServingGraph(context.Background(), t, ts)
-}
-
-func TestWatchEndPoints(t *testing.T) {
-	ts := newTestServer(t, []string{"test"})
-	defer ts.Close()
-	test.CheckWatchEndPoints(context.Background(), t, ts)
-}
-
+// Test etcd-specific heartbeat (TTL).
 func TestKeyspaceLock(t *testing.T) {
+	ctx := context.Background()
 	ts := newTestServer(t, []string{"test"})
 	defer ts.Close()
-	test.CheckKeyspaceLock(t, ts)
-}
 
-func TestShardLock(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping wait-based test in short mode.")
+	if err := ts.CreateKeyspace(ctx, "test_keyspace", &topodatapb.Keyspace{}); err != nil {
+		t.Fatalf("CreateKeyspace: %v", err)
 	}
 
-	ts := newTestServer(t, []string{"test"})
-	defer ts.Close()
-	test.CheckShardLock(t, ts)
-}
-
-func TestSrvShardLock(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping wait-based test in short mode.")
+	// Long TTL, unlock before timeout.
+	*lockTTL = 1000 * time.Second
+	actionPath, err := ts.LockKeyspaceForAction(ctx, "test_keyspace", "contents")
+	if err != nil {
+		t.Fatalf("LockKeyspaceForAction failed: %v", err)
+	}
+	if err := ts.UnlockKeyspaceForAction(ctx, "test_keyspace", actionPath, "results"); err != nil {
+		t.Fatalf("UnlockKeyspaceForAction failed: %v", err)
 	}
 
-	ts := newTestServer(t, []string{"test"})
-	defer ts.Close()
-	test.CheckSrvShardLock(t, ts)
-}
-
-func TestVSchema(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping wait-based test in short mode.")
+	// Short TTL, make sure it doesn't expire.
+	*lockTTL = time.Second
+	actionPath, err = ts.LockKeyspaceForAction(ctx, "test_keyspace", "contents")
+	if err != nil {
+		t.Fatalf("LockKeyspaceForAction failed: %v", err)
+	}
+	time.Sleep(2 * time.Second)
+	if err := ts.UnlockKeyspaceForAction(ctx, "test_keyspace", actionPath, "results"); err != nil {
+		t.Fatalf("UnlockKeyspaceForAction failed: %v", err)
 	}
 
-	ts := newTestServer(t, []string{"test"})
-	defer ts.Close()
-	test.CheckVSchema(t, ts)
+	// Short TTL, lose the lock.
+	*lockTTL = time.Second
+	actionPath, err = ts.LockKeyspaceForAction(ctx, "test_keyspace", "contents")
+	if err != nil {
+		t.Fatalf("LockKeyspaceForAction failed: %v", err)
+	}
+	if _, err := ts.getGlobal().Delete(path.Join(keyspaceDirPath("test_keyspace"), lockFilename), false); err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+	if err := ts.UnlockKeyspaceForAction(ctx, "test_keyspace", actionPath, "results"); err != topo.ErrNoNode {
+		t.Fatalf("UnlockKeyspaceForAction = %v, want %v", err, topo.ErrNoNode)
+	}
+
+	// Short TTL, force expiry.
+	*lockTTL = time.Second
+	ignoreTTLRefresh = true
+	actionPath, err = ts.LockKeyspaceForAction(ctx, "test_keyspace", "contents")
+	if err != nil {
+		t.Fatalf("LockKeyspaceForAction failed: %v", err)
+	}
+	time.Sleep(2 * time.Second)
+	if err := ts.UnlockKeyspaceForAction(ctx, "test_keyspace", actionPath, "results"); err != topo.ErrNoNode {
+		t.Fatalf("UnlockKeyspaceForAction = %v, want %v", err, topo.ErrNoNode)
+	}
+	ignoreTTLRefresh = false
 }

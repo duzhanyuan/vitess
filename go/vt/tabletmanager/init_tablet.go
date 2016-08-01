@@ -15,11 +15,11 @@ import (
 	log "github.com/golang/glog"
 	"github.com/youtube/vitess/go/flagutil"
 	"github.com/youtube/vitess/go/netutil"
-	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/tabletmanager/actionnode"
 	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/topotools"
+	"github.com/youtube/vitess/go/vt/topo/topoproto"
 	"golang.org/x/net/context"
+
+	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
 )
 
 var (
@@ -27,7 +27,7 @@ var (
 	initKeyspace       = flag.String("init_keyspace", "", "(init parameter) keyspace to use for this tablet")
 	initShard          = flag.String("init_shard", "", "(init parameter) shard to use for this tablet")
 	initTags           flagutil.StringMapValue
-	initTabletType     = flag.String("init_tablet_type", "", "(init parameter) the tablet type to use for this tablet. Incompatible with target_tablet_type.")
+	initTabletType     = flag.String("init_tablet_type", "", "(init parameter) the tablet type to use for this tablet.")
 	initTimeout        = flag.Duration("init_timeout", 1*time.Minute, "(init parameter) timeout to use for the init phase.")
 )
 
@@ -36,133 +36,99 @@ func init() {
 }
 
 // InitTablet initializes the tablet record if necessary.
-func (agent *ActionAgent) InitTablet(port, securePort int) error {
-	// only enabled if one of init_tablet_type (when healthcheck
-	// is disabled) or init_keyspace (when healthcheck is enabled)
-	// is passed in, then check other parameters
-	if *initTabletType == "" && *initKeyspace == "" {
+func (agent *ActionAgent) InitTablet(port, gRPCPort int32) error {
+	// it should be either we have all three of init_keyspace,
+	// init_shard and init_tablet_type, or none.
+	if *initKeyspace == "" && *initShard == "" && *initTabletType == "" {
+		// not initializing the record
 		return nil
 	}
+	if *initKeyspace == "" || *initShard == "" || *initTabletType == "" {
+		return fmt.Errorf("either need all of init_keyspace, init_shard and init_tablet_type, or none")
+	}
 
-	// figure out our default target type
-	var tabletType topo.TabletType
-	if *initTabletType != "" {
-		if *targetTabletType != "" {
-			log.Fatalf("cannot specify both target_tablet_type and init_tablet_type parameters (as they might conflict)")
-		}
+	// parse init_tablet_type
+	tabletType, err := topoproto.ParseTabletType(*initTabletType)
+	if err != nil {
+		return fmt.Errorf("invalid init_tablet_type %v: %v", *initTabletType, err)
+	}
+	if tabletType == topodatapb.TabletType_MASTER {
+		// We disallow MASTER, so we don't have to change
+		// shard.MasterAlias, and deal with the corner cases.
+		return fmt.Errorf("init_tablet_type cannot be master, use replica instead")
+	}
 
-		// use the type specified on the command line
-		tabletType = topo.TabletType(*initTabletType)
-		if !topo.IsTypeInList(tabletType, topo.AllTabletTypes) {
-			log.Fatalf("InitTablet encountered unknown init_tablet_type '%v'", *initTabletType)
-		}
-		if tabletType == topo.TYPE_MASTER || tabletType == topo.TYPE_SCRAP {
-			// We disallow TYPE_MASTER, so we don't have to change
-			// shard.MasterAlias, and deal with the corner cases.
-			// We also disallow TYPE_SCRAP, obviously.
-			log.Fatalf("init_tablet_type cannot be %v", tabletType)
-		}
-
-	} else if *targetTabletType != "" {
-		// use spare, the healthcheck will turn us into what
-		// we need to be eventually
-		tabletType = topo.TYPE_SPARE
-
-	} else {
-		log.Fatalf("if init tablet is enabled, one of init_tablet_type or target_tablet_type needs to be specified")
+	// parse and validate shard name
+	shard, _, err := topo.ValidateShardName(*initShard)
+	if err != nil {
+		return fmt.Errorf("cannot validate shard name %v: %v", *initShard, err)
 	}
 
 	// create a context for this whole operation
 	ctx, cancel := context.WithTimeout(agent.batchCtx, *initTimeout)
 	defer cancel()
 
-	// if we're assigned to a shard, make sure it exists, see if
-	// we are its master, and update its cells list if necessary
-	if tabletType != topo.TYPE_IDLE {
-		if *initKeyspace == "" || *initShard == "" {
-			log.Fatalf("if init tablet is enabled and the target type is not idle, init_keyspace and init_shard also need to be specified")
+	// read the shard, create it if necessary
+	log.Infof("Reading shard record %v/%v", *initKeyspace, shard)
+	si, err := agent.TopoServer.GetOrCreateShard(ctx, *initKeyspace, shard)
+	if err != nil {
+		return fmt.Errorf("InitTablet cannot GetOrCreateShard shard: %v", err)
+	}
+	if si.MasterAlias != nil && topoproto.TabletAliasEqual(si.MasterAlias, agent.TabletAlias) {
+		// We're marked as master in the shard record, which could mean the master
+		// tablet process was just restarted. However, we need to check if a new
+		// master is in the process of taking over. In that case, it will let us
+		// know by forcibly updating the old master's tablet record.
+		oldTablet, err := agent.TopoServer.GetTablet(ctx, agent.TabletAlias)
+		switch err {
+		case topo.ErrNoNode:
+			// There's no existing tablet record, so we can assume
+			// no one has left us a message to step down.
+			tabletType = topodatapb.TabletType_MASTER
+		case nil:
+			if oldTablet.Type == topodatapb.TabletType_MASTER {
+				// We're marked as master in the shard record,
+				// and our existing tablet record agrees.
+				tabletType = topodatapb.TabletType_MASTER
+			}
+		default:
+			return fmt.Errorf("InitTablet failed to read existing tablet record: %v", err)
 		}
-		shard, _, err := topo.ValidateShardName(*initShard)
+	}
+
+	// See if we need to add the tablet's cell to the shard's cell list.
+	if !si.HasCell(agent.TabletAlias.Cell) {
+		si, err = agent.TopoServer.UpdateShardFields(ctx, *initKeyspace, shard, func(si *topo.ShardInfo) error {
+			if si.HasCell(agent.TabletAlias.Cell) {
+				// Someone else already did it.
+				return topo.ErrNoUpdateNeeded
+			}
+			si.Cells = append(si.Cells, agent.TabletAlias.Cell)
+			return nil
+		})
 		if err != nil {
-			log.Fatalf("cannot validate shard name: %v", err)
-		}
-
-		log.Infof("Reading shard record %v/%v", *initKeyspace, shard)
-
-		// read the shard, create it if necessary
-		si, err := agent.TopoServer.GetShard(*initKeyspace, shard)
-		if err == topo.ErrNoNode {
-			// create the keyspace, maybe it already exists
-			if err := agent.TopoServer.CreateKeyspace(*initKeyspace, &topo.Keyspace{}); err != nil && err != topo.ErrNodeExists {
-				return fmt.Errorf("CreateKeyspace(%v) failed: %v", *initKeyspace, err)
-			}
-
-			// create the shard
-			if err := topo.CreateShard(agent.TopoServer, *initKeyspace, shard); err != nil {
-				return fmt.Errorf("CreateShard(%v/%v) failed: %v", *initKeyspace, shard, err)
-			}
-
-			// and re-read the shard object
-			si, err = agent.TopoServer.GetShard(*initKeyspace, shard)
-		}
-		if err != nil {
-			return fmt.Errorf("InitTablet cannot read shard: %v", err)
-		}
-		if si.MasterAlias == agent.TabletAlias {
-			// we are the current master for this shard (probably
-			// means the master tablet process was just restarted),
-			// so InitTablet as master.
-			tabletType = topo.TYPE_MASTER
-		}
-
-		// See if we need to add the tablet's cell to the shard's cell
-		// list.  If we do, it has to be under the shard lock.
-		if !si.HasCell(agent.TabletAlias.Cell) {
-			actionNode := actionnode.UpdateShard()
-			lockPath, err := actionNode.LockShard(ctx, agent.TopoServer, *initKeyspace, shard)
-			if err != nil {
-				return fmt.Errorf("LockShard(%v/%v) failed: %v", *initKeyspace, shard, err)
-			}
-
-			// re-read the shard with the lock
-			si, err = agent.TopoServer.GetShard(*initKeyspace, shard)
-			if err != nil {
-				return actionNode.UnlockShard(ctx, agent.TopoServer, *initKeyspace, shard, lockPath, err)
-			}
-
-			// see if we really need to update it now
-			if !si.HasCell(agent.TabletAlias.Cell) {
-				si.Cells = append(si.Cells, agent.TabletAlias.Cell)
-
-				// write it back
-				if err := topo.UpdateShard(ctx, agent.TopoServer, si); err != nil {
-					return actionNode.UnlockShard(ctx, agent.TopoServer, *initKeyspace, shard, lockPath, err)
-				}
-			}
-
-			// and unlock
-			if err := actionNode.UnlockShard(ctx, agent.TopoServer, *initKeyspace, shard, lockPath, nil); err != nil {
-				return err
-			}
+			return fmt.Errorf("couldn't add tablet's cell to shard record: %v", err)
 		}
 	}
 	log.Infof("Initializing the tablet for type %v", tabletType)
 
 	// figure out the hostname
 	hostname := *tabletHostname
-	if hostname == "" {
-		var err error
-		hostname, err = netutil.FullyQualifiedHostname()
+	if hostname != "" {
+		log.Infof("Using hostname: %v from -tablet_hostname flag.", hostname)
+	} else {
+		hostname, err := netutil.FullyQualifiedHostname()
 		if err != nil {
 			return err
 		}
+		log.Infof("Using detected machine hostname: %v To change this, fix your machine network configuration or override it with -tablet_hostname.", hostname)
 	}
 
 	// create and populate tablet record
-	tablet := &topo.Tablet{
+	tablet := &topodatapb.Tablet{
 		Alias:          agent.TabletAlias,
 		Hostname:       hostname,
-		Portmap:        make(map[string]int),
+		PortMap:        make(map[string]int32),
 		Keyspace:       *initKeyspace,
 		Shard:          *initShard,
 		Type:           tabletType,
@@ -170,32 +136,29 @@ func (agent *ActionAgent) InitTablet(port, securePort int) error {
 		Tags:           initTags,
 	}
 	if port != 0 {
-		tablet.Portmap["vt"] = port
+		tablet.PortMap["vt"] = port
 	}
-	if securePort != 0 {
-		tablet.Portmap["vts"] = securePort
+	if gRPCPort != 0 {
+		tablet.PortMap["grpc"] = gRPCPort
 	}
-	if err := tablet.Complete(); err != nil {
-		return fmt.Errorf("InitTablet tablet.Complete failed: %v", err)
+	if err := topo.TabletComplete(tablet); err != nil {
+		return fmt.Errorf("InitTablet TabletComplete failed: %v", err)
 	}
 
 	// now try to create the record
-	err := topo.CreateTablet(ctx, agent.TopoServer, tablet)
+	err = agent.TopoServer.CreateTablet(ctx, tablet)
 	switch err {
 	case nil:
 		// it worked, we're good, can update the replication graph
-		if tablet.IsInReplicationGraph() {
-			if err := topo.UpdateTabletReplicationData(ctx, agent.TopoServer, tablet); err != nil {
-				return fmt.Errorf("UpdateTabletReplicationData failed: %v", err)
-			}
+		if err := topo.UpdateTabletReplicationData(ctx, agent.TopoServer, tablet); err != nil {
+			return fmt.Errorf("UpdateTabletReplicationData failed: %v", err)
 		}
 
 	case topo.ErrNodeExists:
-		// The node already exists, will just try to update
-		// it. So we read it first.
-		oldTablet, err := agent.TopoServer.GetTablet(tablet.Alias)
+		// The node already exists, will just try to update it. So we read it first.
+		oldTablet, err := agent.TopoServer.GetTablet(ctx, tablet.Alias)
 		if err != nil {
-			fmt.Errorf("InitTablet failed to read existing tablet record: %v", err)
+			return fmt.Errorf("InitTablet failed to read existing tablet record: %v", err)
 		}
 
 		// Sanity check the keyspace and shard
@@ -203,9 +166,8 @@ func (agent *ActionAgent) InitTablet(port, securePort int) error {
 			return fmt.Errorf("InitTablet failed because existing tablet keyspace and shard %v/%v differ from the provided ones %v/%v", oldTablet.Keyspace, oldTablet.Shard, tablet.Keyspace, tablet.Shard)
 		}
 
-		// And overwrite the rest
-		*(oldTablet.Tablet) = *tablet
-		if err := topo.UpdateTablet(ctx, agent.TopoServer, oldTablet); err != nil {
+		// Then overwrite everything, ignoring version mismatch.
+		if err := agent.TopoServer.UpdateTablet(ctx, topo.NewTabletInfo(tablet, -1)); err != nil {
 			return fmt.Errorf("UpdateTablet failed: %v", err)
 		}
 
@@ -214,14 +176,6 @@ func (agent *ActionAgent) InitTablet(port, securePort int) error {
 		// in the replication graph
 	default:
 		return fmt.Errorf("CreateTablet failed: %v", err)
-	}
-
-	// and now rebuild the serving graph. Note we do that in any case,
-	// to clean any inaccurate record from any part of the serving graph.
-	if tabletType != topo.TYPE_IDLE {
-		if _, err := topotools.RebuildShard(ctx, logutil.NewConsoleLogger(), agent.TopoServer, tablet.Keyspace, tablet.Shard, []string{tablet.Alias.Cell}, agent.LockTimeout); err != nil {
-			return fmt.Errorf("RebuildShard failed: %v", err)
-		}
 	}
 
 	return nil

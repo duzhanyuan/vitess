@@ -82,6 +82,10 @@ func Register(nvh NewVarHook) {
 
 // Publish is expvar.Publish+hook
 func Publish(name string, v expvar.Var) {
+	publish(name, v)
+}
+
+func publish(name string, v expvar.Var) {
 	defaultVarGroup.publish(name, v)
 }
 
@@ -116,7 +120,7 @@ func RegisterPushBackend(name string, backend PushBackend) {
 func emitToBackend(emitPeriod *time.Duration) {
 	ticker := time.NewTicker(*emitPeriod)
 	defer ticker.Stop()
-	for _ = range ticker.C {
+	for range ticker.C {
 		backend, ok := pushBackends[*statsBackend]
 		if !ok {
 			log.Errorf("No PushBackend registered with name %s", *statsBackend)
@@ -139,7 +143,7 @@ type Float struct {
 // NewFloat creates a new Float and exports it.
 func NewFloat(name string) *Float {
 	v := new(Float)
-	Publish(name, v)
+	publish(name, v)
 	return v
 }
 
@@ -187,7 +191,9 @@ type Int struct {
 // NewInt returns a new Int
 func NewInt(name string) *Int {
 	v := new(Int)
-	Publish(name, v)
+	if name != "" {
+		publish(name, v)
+	}
 	return v
 }
 
@@ -219,7 +225,7 @@ type Duration struct {
 // NewDuration returns a new Duration
 func NewDuration(name string) *Duration {
 	v := new(Duration)
-	Publish(name, v)
+	publish(name, v)
 	return v
 }
 
@@ -270,7 +276,7 @@ type String struct {
 // NewString returns a new String
 func NewString(name string) *String {
 	v := new(String)
-	Publish(name, v)
+	publish(name, v)
 	return v
 }
 
@@ -315,7 +321,7 @@ func (f JSONFunc) String() string {
 // a JSON string as a variable. The string is sent to
 // expvar as is.
 func PublishJSONFunc(name string, f func() string) {
-	Publish(name, JSONFunc(f))
+	publish(name, JSONFunc(f))
 }
 
 // StringMap is a map of string -> string
@@ -327,7 +333,7 @@ type StringMap struct {
 // NewStringMap returns a new StringMap
 func NewStringMap(name string) *StringMap {
 	v := &StringMap{values: make(map[string]string)}
-	Publish(name, v)
+	publish(name, v)
 	return v
 }
 

@@ -10,57 +10,57 @@ import (
 	"testing"
 	"time"
 
-	mproto "github.com/youtube/vitess/go/mysql/proto"
 	"github.com/youtube/vitess/go/sqltypes"
-	"github.com/youtube/vitess/go/vt/key"
 	"github.com/youtube/vitess/go/vt/logutil"
-	myproto "github.com/youtube/vitess/go/vt/mysqlctl/proto"
-	"github.com/youtube/vitess/go/vt/tabletmanager/faketmclient"
-	_ "github.com/youtube/vitess/go/vt/tabletmanager/gorpctmclient"
-	"github.com/youtube/vitess/go/vt/tabletserver/gorpcqueryservice"
-	_ "github.com/youtube/vitess/go/vt/tabletserver/gorpctabletconn"
-	"github.com/youtube/vitess/go/vt/tabletserver/proto"
-	"github.com/youtube/vitess/go/vt/tabletserver/queryservice"
-	"github.com/youtube/vitess/go/vt/topo"
+	"github.com/youtube/vitess/go/vt/mysqlctl/tmutils"
+	"github.com/youtube/vitess/go/vt/tabletserver/grpcqueryservice"
+	"github.com/youtube/vitess/go/vt/tabletserver/queryservice/fakes"
+	"github.com/youtube/vitess/go/vt/vttest/fakesqldb"
 	"github.com/youtube/vitess/go/vt/wrangler"
 	"github.com/youtube/vitess/go/vt/wrangler/testlib"
-	"github.com/youtube/vitess/go/vt/zktopo"
+	"github.com/youtube/vitess/go/vt/zktopo/zktestserver"
 	"golang.org/x/net/context"
+
+	querypb "github.com/youtube/vitess/go/vt/proto/query"
+	tabletmanagerdatapb "github.com/youtube/vitess/go/vt/proto/tabletmanagerdata"
+	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	vschemapb "github.com/youtube/vitess/go/vt/proto/vschema"
 )
 
-// destinationSqlQuery is a local QueryService implementation to
+// destinationTabletServer is a local QueryService implementation to
 // support the tests
-type destinationSqlQuery struct {
-	queryservice.ErrorQueryService
-	t             *testing.T
+type destinationTabletServer struct {
+	t *testing.T
+
+	*fakes.StreamHealthQueryService
 	excludedTable string
 }
 
-func (sq *destinationSqlQuery) StreamExecute(ctx context.Context, query *proto.Query, sendReply func(reply *mproto.QueryResult) error) error {
-	if strings.Contains(query.Sql, sq.excludedTable) {
-		sq.t.Errorf("Split Diff operation on destination should skip the excluded table: %v query: %v", sq.excludedTable, query.Sql)
+func (sq *destinationTabletServer) StreamExecute(ctx context.Context, target *querypb.Target, sql string, bindVariables map[string]interface{}, sendReply func(reply *sqltypes.Result) error) error {
+	if strings.Contains(sql, sq.excludedTable) {
+		sq.t.Errorf("Split Diff operation on destination should skip the excluded table: %v query: %v", sq.excludedTable, sql)
 	}
 
-	if hasKeyspace := strings.Contains(query.Sql, "WHERE keyspace_id"); hasKeyspace == true {
-		sq.t.Errorf("Sql query on destination should not contain a keyspace_id WHERE clause; query received: %v", query.Sql)
+	if hasKeyspace := strings.Contains(sql, "WHERE keyspace_id"); hasKeyspace == true {
+		sq.t.Errorf("Sql query on destination should not contain a keyspace_id WHERE clause; query received: %v", sql)
 	}
 
-	sq.t.Logf("destinationSqlQuery: got query: %v", *query)
+	sq.t.Logf("destinationTabletServer: got query: %v", sql)
 
 	// Send the headers
-	if err := sendReply(&mproto.QueryResult{
-		Fields: []mproto.Field{
-			mproto.Field{
+	if err := sendReply(&sqltypes.Result{
+		Fields: []*querypb.Field{
+			{
 				Name: "id",
-				Type: mproto.VT_LONGLONG,
+				Type: sqltypes.Int64,
 			},
-			mproto.Field{
+			{
 				Name: "msg",
-				Type: mproto.VT_VARCHAR,
+				Type: sqltypes.VarChar,
 			},
-			mproto.Field{
+			{
 				Name: "keyspace_id",
-				Type: mproto.VT_LONGLONG,
+				Type: sqltypes.Int64,
 			},
 		},
 	}); err != nil {
@@ -70,9 +70,13 @@ func (sq *destinationSqlQuery) StreamExecute(ctx context.Context, query *proto.Q
 	// Send the values
 	ksids := []uint64{0x2000000000000000, 0x6000000000000000}
 	for i := 0; i < 100; i++ {
-		if err := sendReply(&mproto.QueryResult{
+		// skip the out-of-range values
+		if i%2 == 1 {
+			continue
+		}
+		if err := sendReply(&sqltypes.Result{
 			Rows: [][]sqltypes.Value{
-				[]sqltypes.Value{
+				{
 					sqltypes.MakeString([]byte(fmt.Sprintf("%v", i))),
 					sqltypes.MakeString([]byte(fmt.Sprintf("Text for %v", i))),
 					sqltypes.MakeString([]byte(fmt.Sprintf("%v", ksids[i%2]))),
@@ -85,41 +89,43 @@ func (sq *destinationSqlQuery) StreamExecute(ctx context.Context, query *proto.Q
 	return nil
 }
 
-// sourceSqlQuery is a local QueryService implementation to support the tests
-type sourceSqlQuery struct {
-	queryservice.ErrorQueryService
-	t             *testing.T
+// sourceTabletServer is a local QueryService implementation to support the tests
+type sourceTabletServer struct {
+	t *testing.T
+
+	*fakes.StreamHealthQueryService
 	excludedTable string
+	v3            bool
 }
 
-func (sq *sourceSqlQuery) StreamExecute(ctx context.Context, query *proto.Query, sendReply func(reply *mproto.QueryResult) error) error {
-	if strings.Contains(query.Sql, sq.excludedTable) {
-		sq.t.Errorf("Split Diff operation on source should skip the excluded table: %v query: %v", sq.excludedTable, query.Sql)
+func (sq *sourceTabletServer) StreamExecute(ctx context.Context, target *querypb.Target, sql string, bindVariables map[string]interface{}, sendReply func(reply *sqltypes.Result) error) error {
+	if strings.Contains(sql, sq.excludedTable) {
+		sq.t.Errorf("Split Diff operation on source should skip the excluded table: %v query: %v", sq.excludedTable, sql)
 	}
 
-	// we test for a keyspace_id where clause, except for on views.
-	if !strings.Contains(query.Sql, "view") {
-		if hasKeyspace := strings.Contains(query.Sql, "WHERE keyspace_id < 0x4000000000000000"); hasKeyspace != true {
-			sq.t.Errorf("Sql query on source should contain a keyspace_id WHERE clause; query received: %v", query.Sql)
+	// we test for a keyspace_id where clause, except for v3
+	if !sq.v3 {
+		if hasKeyspace := strings.Contains(sql, "WHERE keyspace_id < 0x4000000000000000"); hasKeyspace != true {
+			sq.t.Errorf("Sql query on source should contain a keyspace_id WHERE clause; query received: %v", sql)
 		}
 	}
 
-	sq.t.Logf("sourceSqlQuery: got query: %v", *query)
+	sq.t.Logf("sourceTabletServer: got query: %v", sql)
 
 	// Send the headers
-	if err := sendReply(&mproto.QueryResult{
-		Fields: []mproto.Field{
-			mproto.Field{
+	if err := sendReply(&sqltypes.Result{
+		Fields: []*querypb.Field{
+			{
 				Name: "id",
-				Type: mproto.VT_LONGLONG,
+				Type: sqltypes.Int64,
 			},
-			mproto.Field{
+			{
 				Name: "msg",
-				Type: mproto.VT_VARCHAR,
+				Type: sqltypes.VarChar,
 			},
-			mproto.Field{
+			{
 				Name: "keyspace_id",
-				Type: mproto.VT_LONGLONG,
+				Type: sqltypes.Int64,
 			},
 		},
 	}); err != nil {
@@ -129,9 +135,13 @@ func (sq *sourceSqlQuery) StreamExecute(ctx context.Context, query *proto.Query,
 	// Send the values
 	ksids := []uint64{0x2000000000000000, 0x6000000000000000}
 	for i := 0; i < 100; i++ {
-		if err := sendReply(&mproto.QueryResult{
+		if !sq.v3 && i%2 == 1 {
+			// for v2, filtering is done at SQL layer
+			continue
+		}
+		if err := sendReply(&sqltypes.Result{
 			Rows: [][]sqltypes.Value{
-				[]sqltypes.Value{
+				{
 					sqltypes.MakeString([]byte(fmt.Sprintf("%v", i))),
 					sqltypes.MakeString([]byte(fmt.Sprintf("Text for %v", i))),
 					sqltypes.MakeString([]byte(fmt.Sprintf("%v", ksids[i%2]))),
@@ -146,89 +156,145 @@ func (sq *sourceSqlQuery) StreamExecute(ctx context.Context, query *proto.Query,
 
 // TODO(aaijazi): Create a test in which source and destination data does not match
 
-func TestSplitDiff(t *testing.T) {
-	ts := zktopo.NewTestServer(t, []string{"cell1", "cell2"})
-	// We need to use FakeTabletManagerClient because we don't have a good way to fake the binlog player yet,
-	// which is necessary for synchronizing replication.
-	wr := wrangler.New(logutil.NewConsoleLogger(), ts, faketmclient.NewFakeTabletManagerClient(), time.Second)
+func testSplitDiff(t *testing.T, v3 bool) {
+	*useV3ReshardingMode = v3
+	db := fakesqldb.Register()
+	ts := zktestserver.New(t, []string{"cell1", "cell2"})
 	ctx := context.Background()
+	wi := NewInstance(ctx, ts, "cell1", time.Second)
 
-	sourceMaster := testlib.NewFakeTablet(t, wr, "cell1", 0,
-		topo.TYPE_MASTER, testlib.TabletKeyspaceShard(t, "ks", "-80"))
-	sourceRdonly1 := testlib.NewFakeTablet(t, wr, "cell1", 1,
-		topo.TYPE_RDONLY, testlib.TabletKeyspaceShard(t, "ks", "-80"),
-		testlib.TabletParent(sourceMaster.Tablet.Alias))
-	sourceRdonly2 := testlib.NewFakeTablet(t, wr, "cell1", 2,
-		topo.TYPE_RDONLY, testlib.TabletKeyspaceShard(t, "ks", "-80"),
-		testlib.TabletParent(sourceMaster.Tablet.Alias))
+	if v3 {
+		if err := ts.CreateKeyspace(ctx, "ks", &topodatapb.Keyspace{}); err != nil {
+			t.Fatalf("CreateKeyspace v3 failed: %v", err)
+		}
 
-	leftMaster := testlib.NewFakeTablet(t, wr, "cell1", 10,
-		topo.TYPE_MASTER, testlib.TabletKeyspaceShard(t, "ks", "-40"))
-	leftRdonly1 := testlib.NewFakeTablet(t, wr, "cell1", 11,
-		topo.TYPE_RDONLY, testlib.TabletKeyspaceShard(t, "ks", "-40"),
-		testlib.TabletParent(leftMaster.Tablet.Alias))
-	leftRdonly2 := testlib.NewFakeTablet(t, wr, "cell1", 12,
-		topo.TYPE_RDONLY, testlib.TabletKeyspaceShard(t, "ks", "-40"),
-		testlib.TabletParent(leftMaster.Tablet.Alias))
+		vs := &vschemapb.Keyspace{
+			Sharded: true,
+			Vindexes: map[string]*vschemapb.Vindex{
+				"table1_index": {
+					Type: "numeric",
+				},
+			},
+			Tables: map[string]*vschemapb.Table{
+				"table1": {
+					ColumnVindexes: []*vschemapb.ColumnVindex{
+						{
+							Column: "keyspace_id",
+							Name:   "table1_index",
+						},
+					},
+				},
+			},
+		}
+		if err := ts.SaveVSchema(ctx, "ks", vs); err != nil {
+			t.Fatalf("SaveVSchema v3 failed: %v", err)
+		}
+	} else {
+		if err := ts.CreateKeyspace(ctx, "ks", &topodatapb.Keyspace{
+			ShardingColumnName: "keyspace_id",
+			ShardingColumnType: topodatapb.KeyspaceIdType_UINT64,
+		}); err != nil {
+			t.Fatalf("CreateKeyspace failed: %v", err)
+		}
+	}
+
+	sourceMaster := testlib.NewFakeTablet(t, wi.wr, "cell1", 0,
+		topodatapb.TabletType_MASTER, db, testlib.TabletKeyspaceShard(t, "ks", "-80"))
+	sourceRdonly1 := testlib.NewFakeTablet(t, wi.wr, "cell1", 1,
+		topodatapb.TabletType_RDONLY, db, testlib.TabletKeyspaceShard(t, "ks", "-80"))
+	sourceRdonly2 := testlib.NewFakeTablet(t, wi.wr, "cell1", 2,
+		topodatapb.TabletType_RDONLY, db, testlib.TabletKeyspaceShard(t, "ks", "-80"))
+
+	leftMaster := testlib.NewFakeTablet(t, wi.wr, "cell1", 10,
+		topodatapb.TabletType_MASTER, db, testlib.TabletKeyspaceShard(t, "ks", "-40"))
+	leftRdonly1 := testlib.NewFakeTablet(t, wi.wr, "cell1", 11,
+		topodatapb.TabletType_RDONLY, db, testlib.TabletKeyspaceShard(t, "ks", "-40"))
+	leftRdonly2 := testlib.NewFakeTablet(t, wi.wr, "cell1", 12,
+		topodatapb.TabletType_RDONLY, db, testlib.TabletKeyspaceShard(t, "ks", "-40"))
 
 	for _, ft := range []*testlib.FakeTablet{sourceMaster, sourceRdonly1, sourceRdonly2, leftMaster, leftRdonly1, leftRdonly2} {
-		ft.StartActionLoop(t, wr)
+		ft.StartActionLoop(t, wi.wr)
 		defer ft.StopActionLoop(t)
 	}
 
 	// add the topo and schema data we'll need
-	if err := topo.CreateShard(ts, "ks", "80-"); err != nil {
+	if err := ts.CreateShard(ctx, "ks", "80-"); err != nil {
 		t.Fatalf("CreateShard(\"-80\") failed: %v", err)
 	}
-	wr.SetSourceShards(ctx, "ks", "-40", []topo.TabletAlias{sourceRdonly1.Tablet.Alias}, nil)
-	if err := wr.SetKeyspaceShardingInfo(ctx, "ks", "keyspace_id", key.KIT_UINT64, 4, false); err != nil {
+	wi.wr.SetSourceShards(ctx, "ks", "-40", []*topodatapb.TabletAlias{sourceRdonly1.Tablet.Alias}, nil)
+	if err := wi.wr.SetKeyspaceShardingInfo(ctx, "ks", "keyspace_id", topodatapb.KeyspaceIdType_UINT64, false); err != nil {
 		t.Fatalf("SetKeyspaceShardingInfo failed: %v", err)
 	}
-	if err := wr.RebuildKeyspaceGraph(ctx, "ks", nil); err != nil {
+	if err := wi.wr.RebuildKeyspaceGraph(ctx, "ks", nil); err != nil {
 		t.Fatalf("RebuildKeyspaceGraph failed: %v", err)
 	}
 
 	excludedTable := "excludedTable1"
-	gwrk := NewSplitDiffWorker(wr, "cell1", "ks", "-40", []string{excludedTable})
-	wrk := gwrk.(*SplitDiffWorker)
 
 	for _, rdonly := range []*testlib.FakeTablet{sourceRdonly1, sourceRdonly2, leftRdonly1, leftRdonly2} {
-		// In reality, the destinations *shouldn't* have identical data to the source - instead, we should see
-		// the data split into left and right. However, if we do that in this test, we would really just be
-		// testing our fake SQL logic, since we do the data filtering in SQL.
-		// To simplify things, just assume that both sides have identical data.
-		rdonly.FakeMysqlDaemon.Schema = &myproto.SchemaDefinition{
+		// The destination only has half the data.
+		// For v2, we do filtering at the SQl level.
+		// For v3, we do it in the client.
+		// So in any case, we need real data.
+		rdonly.FakeMysqlDaemon.Schema = &tabletmanagerdatapb.SchemaDefinition{
 			DatabaseSchema: "",
-			TableDefinitions: []*myproto.TableDefinition{
-				&myproto.TableDefinition{
+			TableDefinitions: []*tabletmanagerdatapb.TableDefinition{
+				{
 					Name:              "table1",
 					Columns:           []string{"id", "msg", "keyspace_id"},
 					PrimaryKeyColumns: []string{"id"},
-					Type:              myproto.TABLE_BASE_TABLE,
+					Type:              tmutils.TableBaseTable,
 				},
-				&myproto.TableDefinition{
+				{
 					Name:              excludedTable,
 					Columns:           []string{"id", "msg", "keyspace_id"},
 					PrimaryKeyColumns: []string{"id"},
-					Type:              myproto.TABLE_BASE_TABLE,
-				},
-				&myproto.TableDefinition{
-					Name: "view1",
-					Type: myproto.TABLE_VIEW,
+					Type:              tmutils.TableBaseTable,
 				},
 			},
 		}
 	}
 
-	leftRdonly1.RPCServer.Register(gorpcqueryservice.New(&destinationSqlQuery{t: t, excludedTable: excludedTable}))
-	leftRdonly2.RPCServer.Register(gorpcqueryservice.New(&destinationSqlQuery{t: t, excludedTable: excludedTable}))
-	sourceRdonly1.RPCServer.Register(gorpcqueryservice.New(&sourceSqlQuery{t: t, excludedTable: excludedTable}))
-	sourceRdonly2.RPCServer.Register(gorpcqueryservice.New(&sourceSqlQuery{t: t, excludedTable: excludedTable}))
-
-	wrk.Run()
-	status := wrk.StatusAsText()
-	t.Logf("Got status: %v", status)
-	if wrk.err != nil || wrk.state != stateSCDone {
-		t.Errorf("Worker run failed")
+	for _, sourceRdonly := range []*testlib.FakeTablet{sourceRdonly1, sourceRdonly2} {
+		qs := fakes.NewStreamHealthQueryService(sourceRdonly.Target())
+		qs.AddDefaultHealthResponse()
+		grpcqueryservice.Register(sourceRdonly.RPCServer, &sourceTabletServer{
+			t: t,
+			StreamHealthQueryService: qs,
+			excludedTable:            excludedTable,
+			v3:                       v3,
+		})
 	}
+
+	for _, destRdonly := range []*testlib.FakeTablet{leftRdonly1, leftRdonly2} {
+		qs := fakes.NewStreamHealthQueryService(destRdonly.Target())
+		qs.AddDefaultHealthResponse()
+		grpcqueryservice.Register(destRdonly.RPCServer, &destinationTabletServer{
+			t: t,
+			StreamHealthQueryService: qs,
+			excludedTable:            excludedTable,
+		})
+	}
+
+	// Run the vtworker command.
+	args := []string{
+		"SplitDiff",
+		"-exclude_tables", excludedTable,
+		"ks/-40",
+	}
+	// We need to use FakeTabletManagerClient because we don't
+	// have a good way to fake the binlog player yet, which is
+	// necessary for synchronizing replication.
+	wr := wrangler.New(logutil.NewConsoleLogger(), ts, newFakeTMCTopo(ts))
+	if err := runCommand(t, wi, wr, args); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSplitDiffv2(t *testing.T) {
+	testSplitDiff(t, false)
+}
+
+func TestSplitDiffv3(t *testing.T) {
+	testSplitDiff(t, true)
 }

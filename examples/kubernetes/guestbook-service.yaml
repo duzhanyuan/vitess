@@ -1,8 +1,16 @@
-apiVersion: v1beta1
 kind: Service
-id: guestbook
-port: 3000
-containerPort: http-server
-selector:
+apiVersion: v1
+metadata:
   name: guestbook
-createExternalLoadBalancer: true
+  labels:
+    component: frontend
+    app: guestbook
+spec:
+  ports:
+    - port: 80
+      targetPort: http-server
+  selector:
+    component: frontend
+    app: guestbook
+  type: LoadBalancer
+

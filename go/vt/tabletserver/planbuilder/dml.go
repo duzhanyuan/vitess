@@ -7,7 +7,6 @@ package planbuilder
 import (
 	"errors"
 	"fmt"
-	"strconv"
 
 	log "github.com/golang/glog"
 	"github.com/youtube/vitess/go/vt/schema"
@@ -16,13 +15,13 @@ import (
 
 func analyzeUpdate(upd *sqlparser.Update, getTable TableGetter) (plan *ExecPlan, err error) {
 	plan = &ExecPlan{
-		PlanId:    PLAN_PASS_DML,
+		PlanID:    PlanPassDML,
 		FullQuery: GenerateFullQuery(upd),
 	}
 
 	tableName := sqlparser.GetTableName(upd.Table)
 	if tableName == "" {
-		plan.Reason = REASON_TABLE
+		plan.Reason = ReasonTable
 		return plan, nil
 	}
 	tableInfo, err := plan.setTableInfo(tableName, getTable)
@@ -30,16 +29,16 @@ func analyzeUpdate(upd *sqlparser.Update, getTable TableGetter) (plan *ExecPlan,
 		return nil, err
 	}
 
-	if len(tableInfo.Indexes) == 0 || tableInfo.Indexes[0].Name != "PRIMARY" {
+	if len(tableInfo.Indexes) == 0 || tableInfo.Indexes[0].Name.Lowered() != "primary" {
 		log.Warningf("no primary key for table %s", tableName)
-		plan.Reason = REASON_TABLE_NOINDEX
+		plan.Reason = ReasonTableNoIndex
 		return plan, nil
 	}
 
 	plan.SecondaryPKValues, err = analyzeUpdateExpressions(upd.Exprs, tableInfo.Indexes[0])
 	if err != nil {
 		if err == ErrTooComplex {
-			plan.Reason = REASON_PK_CHANGE
+			plan.Reason = ReasonPKChange
 			return plan, nil
 		}
 		return nil, err
@@ -47,32 +46,26 @@ func analyzeUpdate(upd *sqlparser.Update, getTable TableGetter) (plan *ExecPlan,
 
 	plan.OuterQuery = GenerateUpdateOuterQuery(upd)
 
-	if conditions := analyzeWhere(upd.Where); conditions != nil {
-		pkValues, err := getPKValues(conditions, tableInfo.Indexes[0])
-		if err != nil {
-			return nil, err
-		}
-		if pkValues != nil {
-			plan.PlanId = PLAN_DML_PK
-			plan.PKValues = pkValues
-			return plan, nil
-		}
+	if pkValues := analyzeWhere(upd.Where, tableInfo.Indexes[0]); pkValues != nil {
+		plan.PlanID = PlanDMLPK
+		plan.PKValues = pkValues
+		return plan, nil
 	}
 
-	plan.PlanId = PLAN_DML_SUBQUERY
+	plan.PlanID = PlanDMLSubquery
 	plan.Subquery = GenerateUpdateSubquery(upd, tableInfo)
 	return plan, nil
 }
 
 func analyzeDelete(del *sqlparser.Delete, getTable TableGetter) (plan *ExecPlan, err error) {
 	plan = &ExecPlan{
-		PlanId:    PLAN_PASS_DML,
+		PlanID:    PlanPassDML,
 		FullQuery: GenerateFullQuery(del),
 	}
 
 	tableName := sqlparser.GetTableName(del.Table)
 	if tableName == "" {
-		plan.Reason = REASON_TABLE
+		plan.Reason = ReasonTable
 		return plan, nil
 	}
 	tableInfo, err := plan.setTableInfo(tableName, getTable)
@@ -80,62 +73,39 @@ func analyzeDelete(del *sqlparser.Delete, getTable TableGetter) (plan *ExecPlan,
 		return nil, err
 	}
 
-	if len(tableInfo.Indexes) == 0 || tableInfo.Indexes[0].Name != "PRIMARY" {
+	if len(tableInfo.Indexes) == 0 || tableInfo.Indexes[0].Name.Lowered() != "primary" {
 		log.Warningf("no primary key for table %s", tableName)
-		plan.Reason = REASON_TABLE_NOINDEX
+		plan.Reason = ReasonTableNoIndex
 		return plan, nil
 	}
 
 	plan.OuterQuery = GenerateDeleteOuterQuery(del)
 
-	if conditions := analyzeWhere(del.Where); conditions != nil {
-		pkValues, err := getPKValues(conditions, tableInfo.Indexes[0])
-		if err != nil {
-			return nil, err
-		}
-		if pkValues != nil {
-			plan.PlanId = PLAN_DML_PK
-			plan.PKValues = pkValues
-			return plan, nil
-		}
+	if pkValues := analyzeWhere(del.Where, tableInfo.Indexes[0]); pkValues != nil {
+		plan.PlanID = PlanDMLPK
+		plan.PKValues = pkValues
+		return plan, nil
 	}
 
-	plan.PlanId = PLAN_DML_SUBQUERY
+	plan.PlanID = PlanDMLSubquery
 	plan.Subquery = GenerateDeleteSubquery(del, tableInfo)
 	return plan, nil
 }
 
 func analyzeSet(set *sqlparser.Set) (plan *ExecPlan) {
-	plan = &ExecPlan{
-		PlanId:    PLAN_SET,
+	return &ExecPlan{
+		PlanID:    PlanSet,
 		FullQuery: GenerateFullQuery(set),
 	}
-	if len(set.Exprs) > 1 { // Multiple set values
-		return plan
-	}
-	updateExpr := set.Exprs[0]
-	plan.SetKey = string(updateExpr.Name.Name)
-	numExpr, ok := updateExpr.Expr.(sqlparser.NumVal)
-	if !ok {
-		return plan
-	}
-	val := string(numExpr)
-	if ival, err := strconv.ParseInt(val, 0, 64); err == nil {
-		plan.SetValue = ival
-	} else if fval, err := strconv.ParseFloat(val, 64); err == nil {
-		plan.SetValue = fval
-	}
-	return plan
 }
 
 func analyzeUpdateExpressions(exprs sqlparser.UpdateExprs, pkIndex *schema.Index) (pkValues []interface{}, err error) {
 	for _, expr := range exprs {
-		index := pkIndex.FindColumn(sqlparser.GetColName(expr.Name))
+		index := pkIndex.FindColumn(expr.Name.Original())
 		if index == -1 {
 			continue
 		}
 		if !sqlparser.IsValue(expr.Expr) {
-			log.Warningf("expression is too complex %v", expr)
 			return nil, ErrTooComplex
 		}
 		if pkValues == nil {
@@ -151,17 +121,17 @@ func analyzeUpdateExpressions(exprs sqlparser.UpdateExprs, pkIndex *schema.Index
 }
 
 func analyzeSelect(sel *sqlparser.Select, getTable TableGetter) (plan *ExecPlan, err error) {
-	// Default plan
 	plan = &ExecPlan{
-		PlanId:     PLAN_PASS_SELECT,
+		PlanID:     PlanPassSelect,
 		FieldQuery: GenerateFieldQuery(sel),
 		FullQuery:  GenerateSelectLimitQuery(sel),
 	}
+	if sel.Lock != "" {
+		plan.PlanID = PlanSelectLock
+	}
 
-	// from
-	tableName, hasHints := analyzeFrom(sel.From)
+	tableName := analyzeFrom(sel.From)
 	if tableName == "" {
-		plan.Reason = REASON_TABLE
 		return plan, nil
 	}
 	tableInfo, err := plan.setTableInfo(tableName, getTable)
@@ -169,167 +139,46 @@ func analyzeSelect(sel *sqlparser.Select, getTable TableGetter) (plan *ExecPlan,
 		return nil, err
 	}
 
-	// There are bind variables in the SELECT list
-	if plan.FieldQuery == nil {
-		plan.Reason = REASON_SELECT_LIST
-		return plan, nil
-	}
-
-	if sel.Distinct != "" || sel.GroupBy != nil || sel.Having != nil {
-		plan.Reason = REASON_SELECT
-		return plan, nil
-	}
-
-	// Don't improve the plan if the select is locking the row
-	if sel.Lock != "" {
-		plan.Reason = REASON_LOCK
-		return plan, nil
-	}
-
-	// Further improvements possible only if table is row-cached
-	if tableInfo.CacheType == schema.CACHE_NONE || tableInfo.CacheType == schema.CACHE_W {
-		plan.Reason = REASON_NOCACHE
-		return plan, nil
-	}
-
-	// Select expressions
-	selects, err := analyzeSelectExprs(sel.SelectExprs, tableInfo)
-	if err != nil {
-		return nil, err
-	}
-	if selects == nil {
-		plan.Reason = REASON_SELECT_LIST
-		return plan, nil
-	}
-	plan.ColumnNumbers = selects
-
-	// where
-	conditions := analyzeWhere(sel.Where)
-	if conditions == nil {
-		plan.Reason = REASON_WHERE
-		return plan, nil
-	}
-
-	// order
-	if sel.OrderBy != nil {
-		plan.Reason = REASON_ORDER
-		return plan, nil
-	}
-
-	// This check should never fail because we only cache tables with primary keys.
-	if len(tableInfo.Indexes) == 0 || tableInfo.Indexes[0].Name != "PRIMARY" {
-		panic("unexpected")
-	}
-
-	pkValues, err := getPKValues(conditions, tableInfo.Indexes[0])
-	if err != nil {
-		return nil, err
-	}
-	if pkValues != nil {
-		plan.IndexUsed = "PRIMARY"
-		offset, rowcount, err := sel.Limit.Limits()
-		if err != nil {
-			return nil, err
+	// Check if it's a NEXT VALUE statement.
+	if _, ok := sel.SelectExprs[0].(sqlparser.Nextval); ok {
+		if tableInfo.Type != schema.Sequence {
+			return nil, fmt.Errorf("%s is not a sequence", tableName)
 		}
-		if offset != nil {
-			plan.Reason = REASON_LIMIT
-			return plan, nil
-		}
-		plan.Limit = rowcount
-		plan.PlanId = PLAN_PK_IN
-		plan.OuterQuery = GenerateSelectOuterQuery(sel, tableInfo)
-		plan.PKValues = pkValues
-		return plan, nil
+		plan.PlanID = PlanNextval
+		plan.FieldQuery = nil
+		plan.FullQuery = nil
 	}
-
-	// TODO: Analyze hints to improve plan.
-	if hasHints {
-		plan.Reason = REASON_HAS_HINTS
-		return plan, nil
-	}
-
-	indexUsed := getIndexMatch(conditions, tableInfo.Indexes)
-	if indexUsed == nil {
-		plan.Reason = REASON_NOINDEX_MATCH
-		return plan, nil
-	}
-	plan.IndexUsed = indexUsed.Name
-	if plan.IndexUsed == "PRIMARY" {
-		plan.Reason = REASON_PKINDEX
-		return plan, nil
-	}
-	var missing bool
-	for _, cnum := range selects {
-		if indexUsed.FindDataColumn(tableInfo.Columns[cnum].Name) != -1 {
-			continue
-		}
-		missing = true
-		break
-	}
-	if !missing {
-		plan.Reason = REASON_COVERING
-		return plan, nil
-	}
-	plan.PlanId = PLAN_SELECT_SUBQUERY
-	plan.OuterQuery = GenerateSelectOuterQuery(sel, tableInfo)
-	plan.Subquery = GenerateSelectSubquery(sel, tableInfo, plan.IndexUsed)
 	return plan, nil
 }
 
-func analyzeSelectExprs(exprs sqlparser.SelectExprs, table *schema.Table) (selects []int, err error) {
-	selects = make([]int, 0, len(exprs))
-	for _, expr := range exprs {
-		switch expr := expr.(type) {
-		case *sqlparser.StarExpr:
-			// Append all columns.
-			for colIndex := range table.Columns {
-				selects = append(selects, colIndex)
-			}
-		case *sqlparser.NonStarExpr:
-			name := sqlparser.GetColName(expr.Expr)
-			if name == "" {
-				// Not a simple column name.
-				return nil, nil
-			}
-			colIndex := table.FindColumn(name)
-			if colIndex == -1 {
-				return nil, fmt.Errorf("column %s not found in table %s", name, table.Name)
-			}
-			selects = append(selects, colIndex)
-		default:
-			panic("unreachable")
-		}
-	}
-	return selects, nil
-}
-
-func analyzeFrom(tableExprs sqlparser.TableExprs) (tablename string, hasHints bool) {
+func analyzeFrom(tableExprs sqlparser.TableExprs) string {
 	if len(tableExprs) > 1 {
-		return "", false
+		return ""
 	}
 	node, ok := tableExprs[0].(*sqlparser.AliasedTableExpr)
 	if !ok {
-		return "", false
+		return ""
 	}
-	return sqlparser.GetTableName(node.Expr), node.Hints != nil
+	return sqlparser.GetTableName(node.Expr)
 }
 
-func analyzeWhere(node *sqlparser.Where) (conditions []sqlparser.BoolExpr) {
+func analyzeWhere(node *sqlparser.Where, pkIndex *schema.Index) []interface{} {
 	if node == nil {
 		return nil
 	}
-	return analyzeBoolean(node.Expr)
+	conditions := analyzeBoolean(node.Expr)
+	if conditions == nil {
+		return nil
+	}
+	return getPKValues(conditions, pkIndex)
 }
 
-func analyzeBoolean(node sqlparser.BoolExpr) (conditions []sqlparser.BoolExpr) {
+func analyzeBoolean(node sqlparser.BoolExpr) (conditions []*sqlparser.ComparisonExpr) {
 	switch node := node.(type) {
 	case *sqlparser.AndExpr:
 		left := analyzeBoolean(node.Left)
 		right := analyzeBoolean(node.Right)
 		if left == nil || right == nil {
-			return nil
-		}
-		if sqlparser.HasINClause(left) && sqlparser.HasINClause(right) {
 			return nil
 		}
 		return append(left, right...)
@@ -339,40 +188,59 @@ func analyzeBoolean(node sqlparser.BoolExpr) (conditions []sqlparser.BoolExpr) {
 		switch {
 		case sqlparser.StringIn(
 			node.Operator,
-			sqlparser.AST_EQ,
-			sqlparser.AST_LT,
-			sqlparser.AST_GT,
-			sqlparser.AST_LE,
-			sqlparser.AST_GE,
-			sqlparser.AST_NSE,
-			sqlparser.AST_LIKE):
+			sqlparser.EqualStr,
+			sqlparser.LikeStr):
 			if sqlparser.IsColName(node.Left) && sqlparser.IsValue(node.Right) {
-				return []sqlparser.BoolExpr{node}
+				return []*sqlparser.ComparisonExpr{node}
 			}
-		case node.Operator == sqlparser.AST_IN:
+		case node.Operator == sqlparser.InStr:
 			if sqlparser.IsColName(node.Left) && sqlparser.IsSimpleTuple(node.Right) {
-				return []sqlparser.BoolExpr{node}
+				return []*sqlparser.ComparisonExpr{node}
 			}
-		}
-	case *sqlparser.RangeCond:
-		if node.Operator != sqlparser.AST_BETWEEN {
-			return nil
-		}
-		if sqlparser.IsColName(node.Left) && sqlparser.IsValue(node.From) && sqlparser.IsValue(node.To) {
-			return []sqlparser.BoolExpr{node}
 		}
 	}
 	return nil
 }
 
+func getPKValues(conditions []*sqlparser.ComparisonExpr, pkIndex *schema.Index) []interface{} {
+	pkValues := make([]interface{}, len(pkIndex.Columns))
+	inClauseSeen := false
+	for _, condition := range conditions {
+		if condition.Operator == sqlparser.InStr {
+			if inClauseSeen {
+				return nil
+			}
+			inClauseSeen = true
+		}
+		index := pkIndex.FindColumn(condition.Left.(*sqlparser.ColName).Name.Original())
+		if index == -1 {
+			return nil
+		}
+		if pkValues[index] != nil {
+			return nil
+		}
+		var err error
+		pkValues[index], err = sqlparser.AsInterface(condition.Right)
+		if err != nil {
+			return nil
+		}
+	}
+	for _, v := range pkValues {
+		if v == nil {
+			return nil
+		}
+	}
+	return pkValues
+}
+
 func analyzeInsert(ins *sqlparser.Insert, getTable TableGetter) (plan *ExecPlan, err error) {
 	plan = &ExecPlan{
-		PlanId:    PLAN_PASS_DML,
+		PlanID:    PlanPassDML,
 		FullQuery: GenerateFullQuery(ins),
 	}
 	tableName := sqlparser.GetTableName(ins.Table)
 	if tableName == "" {
-		plan.Reason = REASON_TABLE
+		plan.Reason = ReasonTable
 		return plan, nil
 	}
 	tableInfo, err := plan.setTableInfo(tableName, getTable)
@@ -380,36 +248,36 @@ func analyzeInsert(ins *sqlparser.Insert, getTable TableGetter) (plan *ExecPlan,
 		return nil, err
 	}
 
-	if len(tableInfo.Indexes) == 0 || tableInfo.Indexes[0].Name != "PRIMARY" {
+	if len(tableInfo.Indexes) == 0 || tableInfo.Indexes[0].Name.Lowered() != "primary" {
 		log.Warningf("no primary key for table %s", tableName)
-		plan.Reason = REASON_TABLE_NOINDEX
+		plan.Reason = ReasonTableNoIndex
 		return plan, nil
 	}
 
 	pkColumnNumbers := getInsertPKColumns(ins.Columns, tableInfo)
 
-	if ins.OnDup != nil {
-		// Upserts are not safe for statement based replication:
-		// http://bugs.mysql.com/bug.php?id=58637
-		plan.Reason = REASON_UPSERT
-		return plan, nil
-	}
-
 	if sel, ok := ins.Rows.(sqlparser.SelectStatement); ok {
-		plan.PlanId = PLAN_INSERT_SUBQUERY
+		if ins.OnDup != nil {
+			// Upserts not allowed for subqueries.
+			// http://bugs.mysql.com/bug.php?id=58637
+			plan.Reason = ReasonUpsert
+			return plan, nil
+		}
+		plan.PlanID = PlanInsertSubquery
 		plan.OuterQuery = GenerateInsertOuterQuery(ins)
 		plan.Subquery = GenerateSelectLimitQuery(sel)
 		if len(ins.Columns) != 0 {
-			plan.ColumnNumbers, err = analyzeSelectExprs(sqlparser.SelectExprs(ins.Columns), tableInfo)
-			if err != nil {
-				return nil, err
+			for _, col := range ins.Columns {
+				colIndex := tableInfo.FindColumn(col.Original())
+				if colIndex == -1 {
+					return nil, fmt.Errorf("column %v not found in table %s", col, tableInfo.Name)
+				}
+				plan.ColumnNumbers = append(plan.ColumnNumbers, colIndex)
 			}
 		} else {
-			// StarExpr node will expand into all columns
-			n := sqlparser.SelectExprs{&sqlparser.StarExpr{}}
-			plan.ColumnNumbers, err = analyzeSelectExprs(n, tableInfo)
-			if err != nil {
-				return nil, err
+			// Add all columns.
+			for colIndex := range tableInfo.Columns {
+				plan.ColumnNumbers = append(plan.ColumnNumbers, colIndex)
 			}
 		}
 		plan.SubqueryPKColumns = pkColumnNumbers
@@ -422,11 +290,37 @@ func analyzeInsert(ins *sqlparser.Insert, getTable TableGetter) (plan *ExecPlan,
 	if err != nil {
 		return nil, err
 	}
-	if pkValues != nil {
-		plan.PlanId = PLAN_INSERT_PK
-		plan.OuterQuery = plan.FullQuery
-		plan.PKValues = pkValues
+	if pkValues == nil {
+		plan.Reason = ReasonComplexExpr
+		return plan, nil
 	}
+	plan.PKValues = pkValues
+	if ins.OnDup == nil {
+		plan.PlanID = PlanInsertPK
+		plan.OuterQuery = sqlparser.GenerateParsedQuery(ins)
+		return plan, nil
+	}
+	if len(rowList) > 1 {
+		// Upsert supported only for single row inserts.
+		plan.Reason = ReasonUpsert
+		return plan, nil
+	}
+	plan.SecondaryPKValues, err = analyzeUpdateExpressions(sqlparser.UpdateExprs(ins.OnDup), tableInfo.Indexes[0])
+	if err != nil {
+		plan.Reason = ReasonPKChange
+		return plan, nil
+	}
+	plan.PlanID = PlanUpsertPK
+	newins := *ins
+	newins.Ignore = ""
+	newins.OnDup = nil
+	plan.OuterQuery = sqlparser.GenerateParsedQuery(&newins)
+	upd := &sqlparser.Update{
+		Comments: ins.Comments,
+		Table:    ins.Table,
+		Exprs:    sqlparser.UpdateExprs(ins.OnDup),
+	}
+	plan.UpsertQuery = GenerateUpdateOuterQuery(upd)
 	return plan, nil
 }
 
@@ -440,7 +334,7 @@ func getInsertPKColumns(columns sqlparser.Columns, tableInfo *schema.Table) (pkC
 		pkColumnNumbers[i] = -1
 	}
 	for i, column := range columns {
-		index := pkIndex.FindColumn(sqlparser.GetColName(column.(*sqlparser.NonStarExpr).Expr))
+		index := pkIndex.FindColumn(column.Original())
 		if index == -1 {
 			continue
 		}
@@ -466,8 +360,7 @@ func getInsertPKValues(pkColumnNumbers []int, rowList sqlparser.Values, tableInf
 				return nil, errors.New("column count doesn't match value count")
 			}
 			node := row[columnNumber]
-			if !sqlparser.IsValue(node) {
-				log.Warningf("insert is too complex %v", node)
+			if !sqlparser.IsNull(node) && !sqlparser.IsValue(node) {
 				return nil, nil
 			}
 			var err error

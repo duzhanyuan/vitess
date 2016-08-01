@@ -9,7 +9,12 @@ import (
 )
 
 func newEtcdClient(machines []string) Client {
-	return etcd.NewClient(machines)
+	c := etcd.NewClient(machines)
+	// Vitess requires strong consistency mode for etcd.
+	if err := c.SetConsistency(etcd.STRONG_CONSISTENCY); err != nil {
+		panic("failed to set consistency on etcd client: " + err.Error())
+	}
+	return c
 }
 
 // Client contains the parts of etcd.Client that are needed.
@@ -19,6 +24,7 @@ type Client interface {
 		prevValue string, prevIndex uint64) (*etcd.Response, error)
 	Create(key string, value string, ttl uint64) (*etcd.Response, error)
 	Delete(key string, recursive bool) (*etcd.Response, error)
+	DeleteDir(key string) (*etcd.Response, error)
 	Get(key string, sort, recursive bool) (*etcd.Response, error)
 	Set(key string, value string, ttl uint64) (*etcd.Response, error)
 	SetCluster(machines []string) bool

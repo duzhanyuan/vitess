@@ -1,65 +1,89 @@
+"""Main python file."""
+
 import os
+import time
 import json
 
 from flask import Flask
+
+from vtdb import vtgate_client
+
+# Register gRPC protocol.
+from vtdb import grpc_vtgate_client  # pylint: disable=unused-import
+
 app = Flask(__name__)
-
-from vtdb import keyrange
-from vtdb import keyrange_constants
-from vtdb import vtgatev2
-from vtdb import vtgate_cursor
-from zk import zkocc
-
-# Constants and params
-UNSHARDED = [keyrange.KeyRange(keyrange_constants.NON_PARTIAL_KEYRANGE)]
 
 # conn is the connection to vtgate.
 conn = None
 
-@app.route("/")
+
+@app.route('/')
 def index():
   return app.send_static_file('index.html')
 
-@app.route("/lrange/guestbook")
-def list_guestbook():
-  # Read the list from a replica.
-  cursor = conn.cursor('test_keyspace', 'replica', keyranges=UNSHARDED)
 
-  cursor.execute('SELECT * FROM test_table ORDER BY id', {})
-  entries = [row[1] for row in cursor.fetchall()]
+@app.route('/page/<int:page>')
+def view(page):
+  _ = page
+  return app.send_static_file('index.html')
+
+
+@app.route('/lrange/guestbook/<int:page>')
+def list_guestbook(page):
+  """Read the list from a replica."""
+  cursor = conn.cursor(
+      tablet_type='replica', keyspace='test_keyspace')
+
+  cursor.execute(
+      'SELECT message, time_created_ns FROM messages WHERE page=:page'
+      ' ORDER BY time_created_ns',
+      {'page': page})
+  entries = [row[0] for row in cursor.fetchall()]
   cursor.close()
 
   return json.dumps(entries)
 
-@app.route("/rpush/guestbook/<value>")
-def add_entry(value):
-  # Insert a row on the master.
-  cursor = conn.cursor('test_keyspace', 'master', keyranges=UNSHARDED, writable=True)
+
+@app.route('/rpush/guestbook/<int:page>/<value>')
+def add_entry(page, value):
+  """Insert a row on the master."""
+  cursor = conn.cursor(
+      tablet_type='master', keyspace='test_keyspace', writable=True)
 
   cursor.begin()
-  cursor.execute('INSERT INTO test_table (msg) VALUES (%(msg)s)',
-    {'msg': value})
+  cursor.execute(
+      'INSERT INTO messages (page, time_created_ns, message)'
+      ' VALUES (:page, :time_created_ns, :message)',
+      {
+          'page': page,
+          'time_created_ns': int(time.time() * 1e9),
+          'message': value,
+      })
   cursor.commit()
 
   # Read the list back from master (critical read) because it's
-  # important that the user sees his own addition immediately.
-  cursor.execute('SELECT * FROM test_table ORDER BY id', {})
-  entries = [row[1] for row in cursor.fetchall()]
+  # important that the user sees their own addition immediately.
+  cursor.execute(
+      'SELECT message, time_created_ns FROM messages WHERE page=:page'
+      ' ORDER BY time_created_ns',
+      {'page': page})
+  entries = [row[0] for row in cursor.fetchall()]
   cursor.close()
 
   return json.dumps(entries)
 
-@app.route("/env")
+
+@app.route('/env')
 def env():
   return json.dumps(dict(os.environ))
 
-if __name__ == "__main__":
-  timeout = 10 # connect timeout in seconds
+if __name__ == '__main__':
+  timeout = 10  # connect timeout in seconds
 
-  # Get vtgate service address from Kubernetes environment.
-  addr = '%s:%s' % (os.environ['VTGATE_SERVICE_HOST'], os.environ['VTGATE_SERVICE_PORT'])
+  # Get vtgate service address from Kubernetes DNS.
+  addr = 'vtgate-test:15991'
 
   # Connect to vtgate.
-  conn = vtgatev2.connect({'vt': [addr]}, timeout)
+  conn = vtgate_client.connect('grpc', addr, timeout)
 
   app.run(host='0.0.0.0', port=8080, debug=True)

@@ -1,8 +1,10 @@
 #!/usr/bin/env python
 
-# Copyright 2014, Google Inc. All rights reserved.
+# Copyright 2014 Google Inc. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can
 # be found in the LICENSE file.
+
+"""Etcd specific configuration."""
 
 import os
 import shutil
@@ -10,12 +12,12 @@ import shutil
 import server
 
 
-class EtcdCluster:
-  """Sets up a global or cell-local etcd cluster"""
+class EtcdCluster(object):
+  """Sets up a global or cell-local etcd cluster."""
 
   def __init__(self, name):
-    import environment
-    import utils
+    import environment  # pylint: disable=g-import-not-at-top
+    import utils  # pylint: disable=g-import-not-at-top
 
     self.port_base = environment.reserve_ports(2)
 
@@ -23,17 +25,21 @@ class EtcdCluster:
     self.hostname = 'localhost'
     self.client_port = self.port_base
     self.peer_port = self.port_base + 1
-    self.client_addr = '%s:%u' % (self.hostname, self.client_port)
-    self.peer_addr = '%s:%u' % (self.hostname, self.peer_port)
-    self.api_url = 'http://%s/v2' % (self.client_addr)
+    self.client_addr = 'http://%s:%d' % (self.hostname, self.client_port)
+    self.peer_addr = 'http://%s:%d' % (self.hostname, self.peer_port)
+    self.api_url = self.client_addr + '/v2'
 
     dirname = 'etcd_' + self.name
     self.data_dir = os.path.join(environment.vtdataroot, dirname)
 
     self.proc = utils.run_bg([
-        'etcd', '-name', self.name, '-addr',
-        self.client_addr, '-peer-addr',
-        self.peer_addr, '-data-dir', self.data_dir],
+        'etcd', '-name', self.name,
+        '-advertise-client-urls', self.client_addr,
+        '-initial-advertise-peer-urls', self.peer_addr,
+        '-listen-client-urls', self.client_addr,
+        '-listen-peer-urls', self.peer_addr,
+        '-initial-cluster', '%s=%s' % (self.name, self.peer_addr),
+        '-data-dir', self.data_dir],
                              stdout=open(os.path.join(
                                  environment.vtlogroot,
                                  dirname + '.stdout'),
@@ -45,12 +51,12 @@ class EtcdCluster:
 
 
 class EtcdTopoServer(server.TopoServer):
-  """Implementation of TopoServer for etcd"""
+  """Implementation of TopoServer for etcd."""
 
   clusters = {}
 
   def setup(self, add_bad_host=False):
-    import utils
+    import utils  # pylint: disable=g-import-not-at-top
 
     for cell in ['global', 'test_ca', 'test_nj', 'test_ny']:
       self.clusters[cell] = EtcdCluster(cell)
@@ -66,10 +72,10 @@ class EtcdTopoServer(server.TopoServer):
         utils.curl(
             '%s/keys/vt/cells/%s' %
             (self.clusters['global'].api_url, cell), request='PUT',
-            data='value=http://' + cluster.client_addr)
+            data='value=' + cluster.client_addr)
 
   def teardown(self):
-    import utils
+    import utils  # pylint: disable=g-import-not-at-top
 
     for cluster in self.clusters.itervalues():
       utils.kill_sub_process(cluster.proc)
@@ -79,11 +85,11 @@ class EtcdTopoServer(server.TopoServer):
   def flags(self):
     return [
         '-topo_implementation', 'etcd',
-        '-etcd_global_addrs', 'http://' + self.clusters['global'].client_addr,
+        '-etcd_global_addrs', self.clusters['global'].client_addr,
     ]
 
   def wipe(self):
-    import utils
+    import utils  # pylint: disable=g-import-not-at-top
 
     for cell, cluster in self.clusters.iteritems():
       if cell == 'global':
@@ -100,5 +106,7 @@ class EtcdTopoServer(server.TopoServer):
             cluster.api_url + '/keys/vt/replication?recursive=true',
             request='DELETE')
 
+  def update_addr(self, cell, keyspace, shard, tablet_index, port):
+    pass
 
 server.flavor_map['etcd'] = EtcdTopoServer()

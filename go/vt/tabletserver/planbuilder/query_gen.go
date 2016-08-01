@@ -7,16 +7,20 @@ package planbuilder
 import (
 	"fmt"
 
+	"github.com/youtube/vitess/go/cistring"
 	"github.com/youtube/vitess/go/vt/schema"
 	"github.com/youtube/vitess/go/vt/sqlparser"
 )
 
+// GenerateFullQuery generates the full query from the ast.
 func GenerateFullQuery(statement sqlparser.Statement) *sqlparser.ParsedQuery {
 	buf := sqlparser.NewTrackedBuffer(nil)
 	statement.Format(buf)
 	return buf.ParsedQuery()
 }
 
+// GenerateFieldQuery generates a query to just fetch the field info
+// by adding impossible where clauses as needed.
 func GenerateFieldQuery(statement sqlparser.Statement) *sqlparser.ParsedQuery {
 	buf := sqlparser.NewTrackedBuffer(FormatImpossible)
 	buf.Myprintf("%v", statement)
@@ -35,7 +39,7 @@ func FormatImpossible(buf *sqlparser.TrackedBuffer, node sqlparser.SQLNode) {
 	case *sqlparser.Select:
 		buf.Myprintf("select %v from %v where 1 != 1", node.SelectExprs, node.From)
 	case *sqlparser.JoinTableExpr:
-		if node.Join == sqlparser.AST_LEFT_JOIN || node.Join == sqlparser.AST_RIGHT_JOIN {
+		if node.Join == sqlparser.LeftJoinStr || node.Join == sqlparser.RightJoinStr {
 			// ON clause is requried
 			buf.Myprintf("%v %s %v on 1 != 1", node.LeftExpr, node.Join, node.RightExpr)
 		} else {
@@ -46,6 +50,7 @@ func FormatImpossible(buf *sqlparser.TrackedBuffer, node sqlparser.SQLNode) {
 	}
 }
 
+// GenerateSelectLimitQuery generates a select query with a limit clause.
 func GenerateSelectLimitQuery(selStmt sqlparser.SelectStatement) *sqlparser.ParsedQuery {
 	buf := sqlparser.NewTrackedBuffer(nil)
 	sel, ok := selStmt.(*sqlparser.Select)
@@ -62,56 +67,34 @@ func GenerateSelectLimitQuery(selStmt sqlparser.SelectStatement) *sqlparser.Pars
 	return buf.ParsedQuery()
 }
 
-func GenerateSelectOuterQuery(sel *sqlparser.Select, tableInfo *schema.Table) *sqlparser.ParsedQuery {
-	buf := sqlparser.NewTrackedBuffer(nil)
-	fmt.Fprintf(buf, "select ")
-	writeColumnList(buf, tableInfo.Columns)
-	buf.Myprintf(" from %v where %a", sel.From, ":#pk")
-	return buf.ParsedQuery()
-}
-
+// GenerateInsertOuterQuery generates the outer query for inserts.
 func GenerateInsertOuterQuery(ins *sqlparser.Insert) *sqlparser.ParsedQuery {
 	buf := sqlparser.NewTrackedBuffer(nil)
-	buf.Myprintf("insert %vinto %v%v values %a%v",
+	buf.Myprintf("insert %v%sinto %v%v values %a",
 		ins.Comments,
+		ins.Ignore,
 		ins.Table,
 		ins.Columns,
 		":#values",
-		ins.OnDup,
 	)
 	return buf.ParsedQuery()
 }
 
+// GenerateUpdateOuterQuery generates the outer query for updates.
 func GenerateUpdateOuterQuery(upd *sqlparser.Update) *sqlparser.ParsedQuery {
 	buf := sqlparser.NewTrackedBuffer(nil)
 	buf.Myprintf("update %v%v set %v where %a", upd.Comments, upd.Table, upd.Exprs, ":#pk")
 	return buf.ParsedQuery()
 }
 
+// GenerateDeleteOuterQuery generates the outer query for deletes.
 func GenerateDeleteOuterQuery(del *sqlparser.Delete) *sqlparser.ParsedQuery {
 	buf := sqlparser.NewTrackedBuffer(nil)
 	buf.Myprintf("delete %vfrom %v where %a", del.Comments, del.Table, ":#pk")
 	return buf.ParsedQuery()
 }
 
-func GenerateSelectSubquery(sel *sqlparser.Select, tableInfo *schema.Table, index string) *sqlparser.ParsedQuery {
-	hint := &sqlparser.IndexHints{Type: sqlparser.AST_USE, Indexes: [][]byte{[]byte(index)}}
-	table_expr := sel.From[0].(*sqlparser.AliasedTableExpr)
-	savedHint := table_expr.Hints
-	table_expr.Hints = hint
-	defer func() {
-		table_expr.Hints = savedHint
-	}()
-	return GenerateSubquery(
-		tableInfo.Indexes[0].Columns,
-		table_expr,
-		sel.Where,
-		sel.OrderBy,
-		sel.Limit,
-		false,
-	)
-}
-
+// GenerateUpdateSubquery generates the subquery for updats.
 func GenerateUpdateSubquery(upd *sqlparser.Update, tableInfo *schema.Table) *sqlparser.ParsedQuery {
 	return GenerateSubquery(
 		tableInfo.Indexes[0].Columns,
@@ -123,6 +106,7 @@ func GenerateUpdateSubquery(upd *sqlparser.Update, tableInfo *schema.Table) *sql
 	)
 }
 
+// GenerateDeleteSubquery generates the subquery for deletes.
 func GenerateDeleteSubquery(del *sqlparser.Delete, tableInfo *schema.Table) *sqlparser.ParsedQuery {
 	return GenerateSubquery(
 		tableInfo.Indexes[0].Columns,
@@ -134,7 +118,8 @@ func GenerateDeleteSubquery(del *sqlparser.Delete, tableInfo *schema.Table) *sql
 	)
 }
 
-func GenerateSubquery(columns []string, table *sqlparser.AliasedTableExpr, where *sqlparser.Where, order sqlparser.OrderBy, limit *sqlparser.Limit, for_update bool) *sqlparser.ParsedQuery {
+// GenerateSubquery generates a subquery based on the input parameters.
+func GenerateSubquery(columns []cistring.CIString, table *sqlparser.AliasedTableExpr, where *sqlparser.Where, order sqlparser.OrderBy, limit *sqlparser.Limit, forUpdate bool) *sqlparser.ParsedQuery {
 	buf := sqlparser.NewTrackedBuffer(nil)
 	if limit == nil {
 		limit = execLimit
@@ -142,20 +127,12 @@ func GenerateSubquery(columns []string, table *sqlparser.AliasedTableExpr, where
 	fmt.Fprintf(buf, "select ")
 	i := 0
 	for i = 0; i < len(columns)-1; i++ {
-		fmt.Fprintf(buf, "%s, ", columns[i])
+		fmt.Fprintf(buf, "%s, ", columns[i].Original())
 	}
-	fmt.Fprintf(buf, "%s", columns[i])
+	fmt.Fprintf(buf, "%s", columns[i].Original())
 	buf.Myprintf(" from %v%v%v%v", table, where, order, limit)
-	if for_update {
-		buf.Myprintf(sqlparser.AST_FOR_UPDATE)
+	if forUpdate {
+		buf.Myprintf(sqlparser.ForUpdateStr)
 	}
 	return buf.ParsedQuery()
-}
-
-func writeColumnList(buf *sqlparser.TrackedBuffer, columns []schema.TableColumn) {
-	i := 0
-	for i = 0; i < len(columns)-1; i++ {
-		fmt.Fprintf(buf, "%s, ", columns[i].Name)
-	}
-	fmt.Fprintf(buf, "%s", columns[i].Name)
 }

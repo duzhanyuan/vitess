@@ -9,32 +9,41 @@ import (
 	"html/template"
 	"io"
 	"net/http"
-	"strconv"
 	"time"
 
 	log "github.com/golang/glog"
 	"github.com/youtube/vitess/go/acl"
+	"github.com/youtube/vitess/go/vt/callerid"
+
+	querypb "github.com/youtube/vitess/go/vt/proto/query"
+	vtrpcpb "github.com/youtube/vitess/go/vt/proto/vtrpc"
 )
 
 var (
-	txlogzHeader = []byte(`<thead>
-
-		<tr>
-			<th>Transaction id</th>
-			<th>Start</th>
-			<th>End</th>
-			<th>Duration</th>
-			<th>Decision</th>
-			<th>Statements</th>
-		</tr>
-</thead>
+	txlogzHeader = []byte(`
+		<thead>
+			<tr>
+				<th>Transaction id</th>
+				<th>Effective caller</th>
+				<th>Immediate caller</th>
+				<th>Start</th>
+				<th>End</th>
+				<th>Duration</th>
+				<th>Decision</th>
+				<th>Statements</th>
+			</tr>
+		</thead>
 	`)
 	txlogzFuncMap = template.FuncMap{
-		"stampMicro": func(t time.Time) string { return t.Format(time.StampMicro) },
+		"stampMicro":         func(t time.Time) string { return t.Format(time.StampMicro) },
+		"getEffectiveCaller": func(e *vtrpcpb.CallerID) string { return callerid.GetPrincipal(e) },
+		"getImmediateCaller": func(i *querypb.VTGateCallerID) string { return callerid.GetUsername(i) },
 	}
 	txlogzTmpl = template.Must(template.New("example").Funcs(txlogzFuncMap).Parse(`
 		<tr class="{{.ColorLevel}}">
 			<td>{{.TransactionID}}</td>
+			<td>{{.EffectiveCallerID | getEffectiveCaller}}</td>
+			<td>{{.ImmediateCallerID | getImmediateCaller}}</td>
 			<td>{{.StartTime | stampMicro}}</td>
 			<td>{{.EndTime | stampMicro}}</td>
 			<td>{{.Duration}}</td>
@@ -51,31 +60,6 @@ func init() {
 	http.HandleFunc("/txlogz", txlogzHandler)
 }
 
-func adjustValue(val int, lower int, upper int) int {
-	if val < lower {
-		return lower
-	} else if val > upper {
-		return upper
-	}
-	return val
-}
-
-func parseReqParam(req *http.Request) (time.Duration, int) {
-	timeout := 10
-	limit := 300
-	if ts, ok := req.URL.Query()["timeout"]; ok {
-		if t, err := strconv.Atoi(ts[0]); err == nil {
-			timeout = adjustValue(t, 0, 60)
-		}
-	}
-	if l, ok := req.URL.Query()["limit"]; ok {
-		if lim, err := strconv.Atoi(l[0]); err == nil {
-			limit = adjustValue(lim, 1, 200000)
-		}
-	}
-	return time.Duration(timeout) * time.Second, limit
-}
-
 // txlogzHandler serves a human readable snapshot of the
 // current transaction log.
 // Endpoint: /txlogz?timeout=%d&limit=%d
@@ -87,7 +71,7 @@ func txlogzHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	timeout, limit := parseReqParam(req)
+	timeout, limit := parseTimeoutLimitParams(req)
 	ch := TxLogger.Subscribe("txlogz")
 	defer TxLogger.Unsubscribe(ch)
 	startHTMLTable(w)
@@ -122,7 +106,9 @@ func txlogzHandler(w http.ResponseWriter, req *http.Request) {
 				Duration   float64
 				ColorLevel string
 			}{txc, duration, level}
-			txlogzTmpl.Execute(w, tmplData)
+			if err := txlogzTmpl.Execute(w, tmplData); err != nil {
+				log.Errorf("txlogz: couldn't execute template: %v", err)
+			}
 		case <-tmr.C:
 			return
 		}

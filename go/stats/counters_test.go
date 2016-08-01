@@ -6,7 +6,11 @@ package stats
 
 import (
 	"expvar"
+	"math/rand"
+	"reflect"
+	"sort"
 	"testing"
+	"time"
 )
 
 func TestCounters(t *testing.T) {
@@ -35,6 +39,23 @@ func TestCounters(t *testing.T) {
 	})
 	if s := f.String(); s != want1 && s != want2 {
 		t.Errorf("want %s or %s, got %s", want1, want2, s)
+	}
+}
+
+func TestCountersTags(t *testing.T) {
+	clear()
+	c := NewCounters("counterTag1")
+	want := map[string]int64{}
+	got := c.Counts()
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("want %v, got %v", want, got)
+	}
+
+	c = NewCounters("counterTag2", "tag1", "tag2")
+	want = map[string]int64{"tag1": 0, "tag2": 0}
+	got = c.Counts()
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("want %v, got %v", want, got)
 	}
 }
 
@@ -83,4 +104,60 @@ func TestCountersHook(t *testing.T) {
 	if gotv != v {
 		t.Errorf("want %#v, got %#v", v, gotv)
 	}
+}
+
+var benchCounter = NewCounters("bench")
+
+func BenchmarkCounters(b *testing.B) {
+	clear()
+	benchCounter.Add("c1", 1)
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			benchCounter.Add("c1", 1)
+		}
+	})
+}
+
+func BenchmarkCountersTailLatency(b *testing.B) {
+	// For this one, ignore the time reported by 'go test'.
+	// The 99th Percentile log line is all that matters.
+	// (Cmd: go test -bench=BenchmarkCountersTailLatency -benchtime=30s -cpu=10)
+	clear()
+	benchCounter.Add("c1", 1)
+	c := make(chan time.Duration, 100)
+	done := make(chan struct{})
+	go func() {
+		all := make([]int, b.N)
+		i := 0
+		for dur := range c {
+			all[i] = int(dur)
+			i++
+		}
+		sort.Ints(all)
+		p99 := time.Duration(all[b.N*99/100])
+		b.Logf("99th Percentile (for N=%v): %v", b.N, p99)
+		close(done)
+	}()
+
+	b.ResetTimer()
+	b.SetParallelism(100) // The actual number of goroutines is 100*GOMAXPROCS
+	b.RunParallel(func(pb *testing.PB) {
+		r := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+		var start time.Time
+
+		for pb.Next() {
+			// sleep between 0~200ms to simulate 10 QPS per goroutine.
+			time.Sleep(time.Duration(r.Int63n(200)) * time.Millisecond)
+			start = time.Now()
+			benchCounter.Add("c1", 1)
+			c <- time.Since(start)
+		}
+	})
+	b.StopTimer()
+
+	close(c)
+	<-done
 }

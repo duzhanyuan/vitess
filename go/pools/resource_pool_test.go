@@ -74,38 +74,6 @@ func TestOpen(t *testing.T) {
 		}
 	}
 
-	// Test TryGet
-	r, err := p.TryGet()
-	if err != nil {
-		t.Errorf("Unexpected error %v", err)
-	}
-	if r != nil {
-		t.Errorf("Expecting nil")
-	}
-	for i := 0; i < 5; i++ {
-		p.Put(resources[i])
-		_, available, _, _, _, _ := p.Stats()
-		if available != int64(i+1) {
-			t.Errorf("expecting %d, received %d", 5-i-1, available)
-		}
-	}
-	for i := 0; i < 5; i++ {
-		r, err := p.TryGet()
-		resources[i] = r
-		if err != nil {
-			t.Errorf("Unexpected error %v", err)
-		}
-		if r == nil {
-			t.Errorf("Expecting non-nil")
-		}
-		if lastID.Get() != 5 {
-			t.Errorf("Expecting 5, received %d", lastID.Get())
-		}
-		if count.Get() != 5 {
-			t.Errorf("Expecting 5, received %d", count.Get())
-		}
-	}
-
 	// Test that Get waits
 	ch := make(chan bool)
 	go func() {
@@ -123,7 +91,7 @@ func TestOpen(t *testing.T) {
 	}()
 	for i := 0; i < 5; i++ {
 		// Sleep to ensure the goroutine waits
-		time.Sleep(10 * time.Nanosecond)
+		time.Sleep(10 * time.Millisecond)
 		p.Put(resources[i])
 	}
 	<-ch
@@ -139,7 +107,7 @@ func TestOpen(t *testing.T) {
 	}
 
 	// Test Close resource
-	r, err = p.Get(ctx)
+	r, err := p.Get(ctx)
 	if err != nil {
 		t.Errorf("Unexpected error %v", err)
 	}
@@ -233,41 +201,30 @@ func TestShrinking(t *testing.T) {
 		}
 		resources[i] = r
 	}
-	go p.SetCapacity(3)
-	time.Sleep(10 * time.Nanosecond)
-	stats := p.StatsJSON()
-	expected := `{"Capacity": 3, "Available": 0, "MaxCapacity": 5, "WaitCount": 0, "WaitTime": 0, "IdleTimeout": 1000000000}`
-	if stats != expected {
-		t.Errorf(`expecting '%s', received '%s'`, expected, stats)
-	}
-
-	// TryGet is allowed when shrinking
-	r, err := p.TryGet()
-	if err != nil {
-		t.Errorf("Unexpected error %v", err)
-	}
-	if r != nil {
-		t.Errorf("Expecting nil")
-	}
-
-	// Get is allowed when shrinking, but it will wait
-	getdone := make(chan bool)
+	done := make(chan bool)
 	go func() {
-		r, err := p.Get(ctx)
-		if err != nil {
-			t.Errorf("Unexpected error %v", err)
-		}
-		p.Put(r)
-		getdone <- true
+		p.SetCapacity(3)
+		done <- true
 	}()
-
-	// Put is allowed when shrinking. It's necessary.
-	for i := 0; i < 4; i++ {
+	expected := `{"Capacity": 3, "Available": 0, "MaxCapacity": 5, "WaitCount": 0, "WaitTime": 0, "IdleTimeout": 1000000000}`
+	for i := 0; i < 10; i++ {
+		time.Sleep(10 * time.Millisecond)
+		stats := p.StatsJSON()
+		if stats != expected {
+			if i == 9 {
+				t.Errorf(`expecting '%s', received '%s'`, expected, stats)
+			}
+		}
+	}
+	// There are already 2 resources available in the pool.
+	// So, returning one should be enough for SetCapacity to complete.
+	p.Put(resources[3])
+	<-done
+	// Return the rest of the resources
+	for i := 0; i < 3; i++ {
 		p.Put(resources[i])
 	}
-	// Wait for Get test to complete
-	<-getdone
-	stats = p.StatsJSON()
+	stats := p.StatsJSON()
 	expected = `{"Capacity": 3, "Available": 3, "MaxCapacity": 5, "WaitCount": 0, "WaitTime": 0, "IdleTimeout": 1000000000}`
 	if stats != expected {
 		t.Errorf(`expecting '%s', received '%s'`, expected, stats)
@@ -278,6 +235,7 @@ func TestShrinking(t *testing.T) {
 
 	// Ensure no deadlock if SetCapacity is called after we start
 	// waiting for a resource
+	var err error
 	for i := 0; i < 3; i++ {
 		resources[i], err = p.Get(ctx)
 		if err != nil {
@@ -291,25 +249,31 @@ func TestShrinking(t *testing.T) {
 			t.Errorf("Unexpected error %v", err)
 		}
 		p.Put(r)
-		getdone <- true
+		done <- true
 	}()
-	time.Sleep(10 * time.Nanosecond)
 
-	// This will wait till we Put
-	go p.SetCapacity(2)
-	time.Sleep(10 * time.Nanosecond)
+	// This will also wait
+	go func() {
+		p.SetCapacity(2)
+		done <- true
+	}()
+	time.Sleep(10 * time.Millisecond)
 
 	// This should not hang
 	for i := 0; i < 3; i++ {
 		p.Put(resources[i])
 	}
-	<-getdone
-	capacity, available, _, _, _, _ := p.Stats()
+	<-done
+	<-done
+	capacity, available, _, waitcount, _, _ := p.Stats()
 	if capacity != 2 {
 		t.Errorf("Expecting 2, received %d", capacity)
 	}
 	if available != 2 {
 		t.Errorf("Expecting 2, received %d", available)
+	}
+	if waitcount != 1 {
+		t.Errorf("Expecting 1, received %d", waitcount)
 	}
 	if count.Get() != 2 {
 		t.Errorf("Expecting 2, received %d", count.Get())
@@ -330,7 +294,7 @@ func TestShrinking(t *testing.T) {
 			t.Errorf("Unexpected error %v", err)
 		}
 		p.Put(r)
-		getdone <- true
+		done <- true
 	}()
 	time.Sleep(10 * time.Nanosecond)
 
@@ -344,7 +308,7 @@ func TestShrinking(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		p.Put(resources[i])
 	}
-	<-getdone
+	<-done
 
 	err = p.SetCapacity(-1)
 	if err == nil {
@@ -507,4 +471,21 @@ func TestTimeout(t *testing.T) {
 		t.Errorf("got %v, want %s", err, want)
 	}
 	p.Put(r)
+}
+
+func TestExpired(t *testing.T) {
+	lastID.Set(0)
+	count.Set(0)
+	p := NewResourcePool(PoolFactory, 1, 1, time.Second)
+	defer p.Close()
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-1*time.Second))
+	r, err := p.Get(ctx)
+	if err == nil {
+		p.Put(r)
+	}
+	cancel()
+	want := "resource pool timed out"
+	if err == nil || err.Error() != want {
+		t.Errorf("got %v, want %s", err, want)
+	}
 }

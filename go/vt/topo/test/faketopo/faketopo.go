@@ -7,6 +7,9 @@ import (
 
 	"github.com/youtube/vitess/go/vt/topo"
 	"golang.org/x/net/context"
+
+	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	vschemapb "github.com/youtube/vitess/go/vt/proto/vschema"
 )
 
 var errNotImplemented = errors.New("Not implemented")
@@ -14,160 +17,192 @@ var errNotImplemented = errors.New("Not implemented")
 // FakeTopo is a topo.Server implementation that always returns errNotImplemented errors.
 type FakeTopo struct{}
 
-func (ft FakeTopo) GetSrvKeyspaceNames(cell string) ([]string, error) {
-	return nil, errNotImplemented
-}
-
-func (ft FakeTopo) GetSrvKeyspace(cell, keyspace string) (*topo.SrvKeyspace, error) {
-	return nil, errNotImplemented
-}
-
-func (ft FakeTopo) GetEndPoints(cell, keyspace, shard string, tabletType topo.TabletType) (*topo.EndPoints, error) {
-	return nil, errNotImplemented
-}
-
+// Close is part of the topo.Server interface.
 func (ft FakeTopo) Close() {}
 
-func (ft FakeTopo) GetKnownCells() ([]string, error) {
+// GetKnownCells is part of the topo.Server interface.
+func (ft FakeTopo) GetKnownCells(ctx context.Context) ([]string, error) {
 	return nil, errNotImplemented
 }
 
-func (ft FakeTopo) CreateKeyspace(keyspace string, value *topo.Keyspace) error {
+// CreateKeyspace is part of the topo.Server interface.
+func (ft FakeTopo) CreateKeyspace(ctx context.Context, keyspace string, value *topodatapb.Keyspace) error {
 	return errNotImplemented
 }
 
-func (ft FakeTopo) UpdateKeyspace(ki *topo.KeyspaceInfo, existingVersion int64) (int64, error) {
+// UpdateKeyspace is part of the topo.Server interface.
+func (ft FakeTopo) UpdateKeyspace(ctx context.Context, keyspace string, value *topodatapb.Keyspace, existingVersion int64) (int64, error) {
 	return 0, errNotImplemented
 }
 
-func (ft FakeTopo) GetKeyspace(keyspace string) (*topo.KeyspaceInfo, error) {
-	return nil, errNotImplemented
-}
-
-func (ft FakeTopo) GetKeyspaces() ([]string, error) {
-	return nil, errNotImplemented
-}
-
-func (ft FakeTopo) DeleteKeyspaceShards(keyspace string) error {
+// DeleteKeyspace is part of the topo.Server interface.
+func (ft FakeTopo) DeleteKeyspace(ctx context.Context, keyspace string) error {
 	return errNotImplemented
 }
 
-func (ft FakeTopo) CreateShard(keyspace, shard string, value *topo.Shard) error {
+// GetKeyspace is part of the topo.Server interface.
+func (ft FakeTopo) GetKeyspace(ctx context.Context, keyspace string) (*topodatapb.Keyspace, int64, error) {
+	return nil, 0, errNotImplemented
+}
+
+// GetKeyspaces is part of the topo.Server interface.
+func (ft FakeTopo) GetKeyspaces(ctx context.Context) ([]string, error) {
+	return nil, errNotImplemented
+}
+
+// DeleteKeyspaceShards is part of the topo.Server interface.
+func (ft FakeTopo) DeleteKeyspaceShards(ctx context.Context, keyspace string) error {
 	return errNotImplemented
 }
 
-func (ft FakeTopo) UpdateShard(si *topo.ShardInfo, existingVersion int64) (int64, error) {
+// CreateShard is part of the topo.Server interface.
+func (ft FakeTopo) CreateShard(ctx context.Context, keyspace, shard string, value *topodatapb.Shard) error {
+	return errNotImplemented
+}
+
+// UpdateShard is part of the topo.Server interface.
+func (ft FakeTopo) UpdateShard(ctx context.Context, keyspace, shard string, value *topodatapb.Shard, existingVersion int64) (int64, error) {
 	return 0, errNotImplemented
 }
 
-func (ft FakeTopo) ValidateShard(keyspace, shard string) error {
+// ValidateShard is part of the topo.Server interface.
+func (ft FakeTopo) ValidateShard(ctx context.Context, keyspace, shard string) error {
 	return errNotImplemented
 }
 
-func (ft FakeTopo) GetShard(keyspace, shard string) (*topo.ShardInfo, error) {
+// GetShard is part of the topo.Server interface.
+func (ft FakeTopo) GetShard(ctx context.Context, keyspace, shard string) (*topodatapb.Shard, int64, error) {
+	return nil, 0, errNotImplemented
+}
+
+// GetShardNames is part of the topo.Server interface.
+func (ft FakeTopo) GetShardNames(ctx context.Context, keyspace string) ([]string, error) {
 	return nil, errNotImplemented
 }
 
-func (ft FakeTopo) GetShardNames(keyspace string) ([]string, error) {
-	return nil, errNotImplemented
-}
-
-func (ft FakeTopo) DeleteShard(keyspace, shard string) error {
+// DeleteShard is part of the topo.Server interface.
+func (ft FakeTopo) DeleteShard(ctx context.Context, keyspace, shard string) error {
 	return errNotImplemented
 }
 
-func (ft FakeTopo) CreateTablet(tablet *topo.Tablet) error {
+// CreateTablet is part of the topo.Server interface.
+func (ft FakeTopo) CreateTablet(ctx context.Context, tablet *topodatapb.Tablet) error {
 	return errNotImplemented
 }
 
-func (ft FakeTopo) UpdateTablet(tablet *topo.TabletInfo, existingVersion int64) (newVersion int64, err error) {
+// UpdateTablet is part of the topo.Server interface.
+func (ft FakeTopo) UpdateTablet(ctx context.Context, tablet *topodatapb.Tablet, existingVersion int64) (newVersion int64, err error) {
 	return 0, errNotImplemented
 }
 
-func (ft FakeTopo) UpdateTabletFields(tabletAlias topo.TabletAlias, update func(*topo.Tablet) error) error {
+// DeleteTablet is part of the topo.Server interface.
+func (ft FakeTopo) DeleteTablet(ctx context.Context, alias *topodatapb.TabletAlias) error {
 	return errNotImplemented
 }
 
-func (ft FakeTopo) DeleteTablet(alias topo.TabletAlias) error {
-	return errNotImplemented
+// GetTablet is part of the topo.Server interface.
+func (ft FakeTopo) GetTablet(ctx context.Context, alias *topodatapb.TabletAlias) (*topodatapb.Tablet, int64, error) {
+	return nil, 0, errNotImplemented
 }
 
-func (ft FakeTopo) GetTablet(alias topo.TabletAlias) (*topo.TabletInfo, error) {
+// GetTabletsByCell is part of the topo.Server interface.
+func (ft FakeTopo) GetTabletsByCell(ctx context.Context, cell string) ([]*topodatapb.TabletAlias, error) {
 	return nil, errNotImplemented
 }
 
-func (ft FakeTopo) GetTabletsByCell(cell string) ([]topo.TabletAlias, error) {
+// UpdateShardReplicationFields is part of the topo.Server interface.
+func (ft FakeTopo) UpdateShardReplicationFields(ctx context.Context, cell, keyspace, shard string, update func(*topodatapb.ShardReplication) error) error {
+	return errNotImplemented
+}
+
+// GetShardReplication is part of the topo.Server interface.
+func (ft FakeTopo) GetShardReplication(ctx context.Context, cell, keyspace, shard string) (*topo.ShardReplicationInfo, error) {
 	return nil, errNotImplemented
 }
 
-func (ft FakeTopo) UpdateShardReplicationFields(cell, keyspace, shard string, update func(*topo.ShardReplication) error) error {
+// DeleteShardReplication is part of the topo.Server interface.
+func (ft FakeTopo) DeleteShardReplication(ctx context.Context, cell, keyspace, shard string) error {
 	return errNotImplemented
 }
 
-func (ft FakeTopo) GetShardReplication(cell, keyspace, shard string) (*topo.ShardReplicationInfo, error) {
+// DeleteKeyspaceReplication is part of the topo.Server interface.
+func (ft FakeTopo) DeleteKeyspaceReplication(ctx context.Context, cell, keyspace string) error {
+	return errNotImplemented
+}
+
+// GetSrvKeyspaceNames is part of the topo.Server interface.
+func (ft FakeTopo) GetSrvKeyspaceNames(ctx context.Context, cell string) ([]string, error) {
 	return nil, errNotImplemented
 }
 
-func (ft FakeTopo) DeleteShardReplication(cell, keyspace, shard string) error {
-	return errNotImplemented
-}
-
-func (ft FakeTopo) LockSrvShardForAction(ctx context.Context, cell, keyspace, shard, contents string) (string, error) {
-	return "", errNotImplemented
-}
-
-func (ft FakeTopo) UnlockSrvShardForAction(cell, keyspace, shard, lockPath, results string) error {
-	return errNotImplemented
-}
-
-func (ft FakeTopo) GetSrvTabletTypesPerShard(cell, keyspace, shard string) ([]topo.TabletType, error) {
+// WatchSrvKeyspace is part of the topo.Server interface.
+func (ft FakeTopo) WatchSrvKeyspace(ctx context.Context, cell, keyspace string) (<-chan *topodatapb.SrvKeyspace, error) {
 	return nil, errNotImplemented
 }
 
-func (ft FakeTopo) UpdateEndPoints(cell, keyspace, shard string, tabletType topo.TabletType, addrs *topo.EndPoints) error {
+// UpdateSrvKeyspace is part of the topo.Server interface.
+func (ft FakeTopo) UpdateSrvKeyspace(ctx context.Context, cell, keyspace string, srvKeyspace *topodatapb.SrvKeyspace) error {
 	return errNotImplemented
 }
 
-func (ft FakeTopo) DeleteEndPoints(cell, keyspace, shard string, tabletType topo.TabletType) error {
+// DeleteSrvKeyspace is part of the topo.Server interface.
+func (ft FakeTopo) DeleteSrvKeyspace(ctx context.Context, cell, keyspace string) error {
 	return errNotImplemented
 }
 
-func (ft FakeTopo) WatchEndPoints(cell, keyspace, shard string, tabletType topo.TabletType) (<-chan *topo.EndPoints, chan<- struct{}, error) {
-	return nil, nil, errNotImplemented
-}
-
-func (ft FakeTopo) UpdateSrvShard(cell, keyspace, shard string, srvShard *topo.SrvShard) error {
-	return errNotImplemented
-}
-
-func (ft FakeTopo) GetSrvShard(cell, keyspace, shard string) (*topo.SrvShard, error) {
+// GetSrvKeyspace is part of the topo.Server interface.
+func (ft FakeTopo) GetSrvKeyspace(ctx context.Context, cell, keyspace string) (*topodatapb.SrvKeyspace, error) {
 	return nil, errNotImplemented
 }
 
-func (ft FakeTopo) DeleteSrvShard(cell, keyspace, shard string) error {
+// WatchSrvVSchema is part of the topo.Server interface.
+func (ft FakeTopo) WatchSrvVSchema(ctx context.Context, cell string) (<-chan *vschemapb.SrvVSchema, error) {
+	return nil, errNotImplemented
+}
+
+// UpdateSrvVSchema is part of the topo.Server interface.
+func (ft FakeTopo) UpdateSrvVSchema(ctx context.Context, cell string, srvVSchema *vschemapb.SrvVSchema) error {
 	return errNotImplemented
 }
 
-func (ft FakeTopo) UpdateSrvKeyspace(cell, keyspace string, srvKeyspace *topo.SrvKeyspace) error {
-	return errNotImplemented
+// GetSrvVSchema is part of the topo.Server interface.
+func (ft FakeTopo) GetSrvVSchema(ctx context.Context, cell string) (*vschemapb.SrvVSchema, error) {
+	return nil, errNotImplemented
 }
 
-func (ft FakeTopo) UpdateTabletEndpoint(cell, keyspace, shard string, tabletType topo.TabletType, addr *topo.EndPoint) error {
-	return errNotImplemented
-}
-
+// LockKeyspaceForAction is part of the topo.Server interface.
 func (ft FakeTopo) LockKeyspaceForAction(ctx context.Context, keyspace, contents string) (string, error) {
 	return "", errNotImplemented
 }
 
-func (ft FakeTopo) UnlockKeyspaceForAction(keyspace, lockPath, results string) error {
+// UnlockKeyspaceForAction is part of the topo.Server interface.
+func (ft FakeTopo) UnlockKeyspaceForAction(ctx context.Context, keyspace, lockPath, results string) error {
 	return errNotImplemented
 }
 
+// LockShardForAction is part of the topo.Server interface.
 func (ft FakeTopo) LockShardForAction(ctx context.Context, keyspace, shard, contents string) (string, error) {
 	return "", errNotImplemented
 }
 
-func (ft FakeTopo) UnlockShardForAction(keyspace, shard, lockPath, results string) error {
+// UnlockShardForAction is part of the topo.Server interface.
+func (ft FakeTopo) UnlockShardForAction(ctx context.Context, keyspace, shard, lockPath, results string) error {
 	return errNotImplemented
 }
+
+// SaveVSchema is part of the topo.Server interface.
+func (ft FakeTopo) SaveVSchema(context.Context, string, *vschemapb.Keyspace) error {
+	return errNotImplemented
+}
+
+// GetVSchema is part of the topo.Server interface.
+func (ft FakeTopo) GetVSchema(ctx context.Context, keyspace string) (*vschemapb.Keyspace, error) {
+	return nil, errNotImplemented
+}
+
+// NewMasterParticipation is part of the topo.Server interface.
+func (ft FakeTopo) NewMasterParticipation(name, id string) (topo.MasterParticipation, error) {
+	return nil, errNotImplemented
+}
+
+var _ topo.Impl = (*FakeTopo)(nil) // compile-time interface check

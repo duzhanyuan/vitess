@@ -10,12 +10,12 @@ import (
 	"fmt"
 
 	log "github.com/golang/glog"
+	"github.com/youtube/vitess/go/mysql"
 	"github.com/youtube/vitess/go/pools"
 	"github.com/youtube/vitess/go/sqldb"
 	"github.com/youtube/vitess/go/sync2"
-	blproto "github.com/youtube/vitess/go/vt/binlog/proto"
 	"github.com/youtube/vitess/go/vt/dbconfigs"
-	"github.com/youtube/vitess/go/vt/mysqlctl/proto"
+	"github.com/youtube/vitess/go/vt/mysqlctl/replication"
 )
 
 // SlaveConnection represents a connection to mysqld that pretends to be a slave
@@ -36,7 +36,7 @@ type SlaveConnection struct {
 // 1) No other processes are making fake slave connections to our mysqld.
 // 2) No real slave servers will have IDs in the range 1-N where N is the peak
 //    number of concurrent fake slave connections we will ever make.
-func NewSlaveConnection(mysqld *Mysqld) (*SlaveConnection, error) {
+func (mysqld *Mysqld) NewSlaveConnection() (*SlaveConnection, error) {
 	params, err := dbconfigs.MysqlParams(mysqld.dba)
 	if err != nil {
 		return nil, err
@@ -64,14 +64,14 @@ var slaveIDPool = pools.NewIDPool()
 // be sent. The stream will continue, waiting for new events if necessary,
 // until the connection is closed, either by the master or by calling
 // SlaveConnection.Close(). At that point, the channel will also be closed.
-func (sc *SlaveConnection) StartBinlogDump(startPos proto.ReplicationPosition) (<-chan blproto.BinlogEvent, error) {
+func (sc *SlaveConnection) StartBinlogDump(startPos replication.Position) (<-chan replication.BinlogEvent, error) {
 	flavor, err := sc.mysqld.flavor()
 	if err != nil {
 		return nil, fmt.Errorf("StartBinlogDump needs flavor: %v", err)
 	}
 
 	log.Infof("sending binlog dump command: startPos=%v, slaveID=%v", startPos, sc.slaveID)
-	if err = flavor.SendBinlogDumpCommand(sc.mysqld, sc, startPos); err != nil {
+	if err = flavor.SendBinlogDumpCommand(sc, startPos); err != nil {
 		log.Errorf("couldn't send binlog dump command: %v", err)
 		return nil, err
 	}
@@ -83,7 +83,7 @@ func (sc *SlaveConnection) StartBinlogDump(startPos proto.ReplicationPosition) (
 		return nil, err
 	}
 
-	eventChan := make(chan blproto.BinlogEvent)
+	eventChan := make(chan replication.BinlogEvent)
 
 	// Start reading events.
 	sc.svm.Go(func(svc *sync2.ServiceContext) error {
@@ -105,8 +105,8 @@ func (sc *SlaveConnection) StartBinlogDump(startPos proto.ReplicationPosition) (
 
 			buf, err = sc.Conn.ReadPacket()
 			if err != nil {
-				if sqlErr, ok := err.(*sqldb.SqlError); ok && sqlErr.Number() == 2013 {
-					// errno 2013 = Lost connection to MySQL server during query
+				if sqlErr, ok := err.(*sqldb.SQLError); ok && sqlErr.Number() == mysql.ErrServerLost {
+					// ErrServerLost = Lost connection to MySQL server during query
 					// This is not necessarily an error. It could just be that we closed
 					// the connection from outside.
 					log.Infof("connection closed during binlog stream (possibly intentional): %v", err)

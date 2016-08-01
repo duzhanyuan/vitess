@@ -1,20 +1,18 @@
 #!/usr/bin/env python
 
 import warnings
+import unittest
+import environment
+import tablet
+import utils
+
 # Dropping a table inexplicably produces a warning despite
 # the "IF EXISTS" clause. Squelch these warnings.
-warnings.simplefilter("ignore")
-
-import os
-import logging
-import unittest
-
-import environment
-import utils
-import tablet
+warnings.simplefilter('ignore')
 
 master_tablet = tablet.Tablet()
 replica_tablet = tablet.Tablet()
+
 
 def setUpModule():
   try:
@@ -31,8 +29,6 @@ def setUpModule():
 
     master_tablet.init_tablet('master', 'test_keyspace', '0')
     replica_tablet.init_tablet('replica', 'test_keyspace', '0')
-    utils.run_vtctl(['RebuildShardGraph', 'test_keyspace/0'])
-    utils.run_vtctl(['RebuildKeyspaceGraph', 'test_keyspace'], auto_log=True)
 
     master_tablet.create_db('vt_test_keyspace')
     replica_tablet.create_db('vt_test_keyspace')
@@ -40,7 +36,9 @@ def setUpModule():
     tearDownModule()
     raise
 
+
 def tearDownModule():
+  utils.required_teardown()
   if utils.options.skip_teardown:
     return
 
@@ -59,11 +57,14 @@ def tearDownModule():
   master_tablet.remove_tree()
   replica_tablet.remove_tree()
 
+
 class TestMysqlctl(unittest.TestCase):
+
   def tearDown(self):
     tablet.Tablet.check_vttablet_count()
     for t in [master_tablet, replica_tablet]:
       t.reset_replication()
+      t.set_semi_sync_enabled(master=False)
       t.clean_dbs()
 
   def test_mysqlctl_restart(self):
@@ -76,12 +77,12 @@ class TestMysqlctl(unittest.TestCase):
     master_tablet.start_vttablet(wait_for_state=None,
                                  extra_env={'MYSQL_FLAVOR': ''})
     replica_tablet.start_vttablet(wait_for_state=None,
-                                 extra_env={'MYSQL_FLAVOR': ''})
+                                  extra_env={'MYSQL_FLAVOR': ''})
     master_tablet.wait_for_vttablet_state('SERVING')
-    replica_tablet.wait_for_vttablet_state('SERVING')
+    replica_tablet.wait_for_vttablet_state('NOT_SERVING')
 
     # reparent tablets, which requires flavor detection
-    utils.run_vtctl(['ReparentShard', '-force', 'test_keyspace/0',
+    utils.run_vtctl(['InitShardMaster', 'test_keyspace/0',
                      master_tablet.tablet_alias], auto_log=True)
 
     master_tablet.kill_vttablet()

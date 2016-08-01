@@ -9,20 +9,18 @@ of the remote execution of vtctl commands.
 package grpcvtctlserver
 
 import (
-	"sync"
-	"time"
-
-	log "github.com/golang/glog"
 	"google.golang.org/grpc"
 
 	"github.com/youtube/vitess/go/vt/logutil"
 	"github.com/youtube/vitess/go/vt/servenv"
 	"github.com/youtube/vitess/go/vt/tabletmanager/tmclient"
 	"github.com/youtube/vitess/go/vt/topo"
+	"github.com/youtube/vitess/go/vt/vtctl"
 	"github.com/youtube/vitess/go/vt/wrangler"
 
-	pb "github.com/youtube/vitess/go/vt/proto/vtctl"
-	"github.com/youtube/vitess/go/vt/vtctl"
+	logutilpb "github.com/youtube/vitess/go/vt/proto/logutil"
+	vtctldatapb "github.com/youtube/vitess/go/vt/proto/vtctldata"
+	vtctlservicepb "github.com/youtube/vitess/go/vt/proto/vtctlservice"
 )
 
 // VtctlServer is our RPC server
@@ -35,55 +33,31 @@ func NewVtctlServer(ts topo.Server) *VtctlServer {
 	return &VtctlServer{ts}
 }
 
-// ExecuteVtctlCommand is part of the pb.VtctlServer interface
-func (s *VtctlServer) ExecuteVtctlCommand(args *pb.ExecuteVtctlCommandArgs, stream pb.Vtctl_ExecuteVtctlCommandServer) (err error) {
-	defer vtctl.HandlePanic(&err)
+// ExecuteVtctlCommand is part of the vtctldatapb.VtctlServer interface
+func (s *VtctlServer) ExecuteVtctlCommand(args *vtctldatapb.ExecuteVtctlCommandRequest, stream vtctlservicepb.Vtctl_ExecuteVtctlCommandServer) (err error) {
+	defer servenv.HandlePanic("vtctl", &err)
 
 	// create a logger, send the result back to the caller
-	logstream := logutil.NewChannelLogger(10)
+	logstream := logutil.NewCallbackLogger(func(e *logutilpb.Event) {
+		// If the client disconnects, we will just fail
+		// to send the log events, but won't interrupt
+		// the command.
+		stream.Send(&vtctldatapb.ExecuteVtctlCommandResponse{
+			Event: e,
+		})
+	})
 	logger := logutil.NewTeeLogger(logstream, logutil.NewConsoleLogger())
 
-	// send logs to the caller
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	go func() {
-		for e := range logstream {
-			// Note we don't interrupt the loop here, as
-			// we still need to flush and finish the
-			// command, even if the channel to the client
-			// has been broken. We'll just keep trying.
-			stream.Send(&pb.LoggerEvent{
-				Time: &pb.Time{
-					Seconds:     e.Time.Unix(),
-					Nanoseconds: int64(e.Time.Nanosecond()),
-				},
-				Level: int64(e.Level),
-				File:  e.File,
-				Line:  int64(e.Line),
-				Value: e.Value,
-			})
-		}
-		wg.Done()
-	}()
-
 	// create the wrangler
-	wr := wrangler.New(logger, s.ts, tmclient.NewTabletManagerClient(), time.Duration(args.LockTimeout))
+	tmc := tmclient.NewTabletManagerClient()
+	defer tmc.Close()
+	wr := wrangler.New(logger, s.ts, tmc)
 
 	// execute the command
-	err = vtctl.RunCommand(stream.Context(), wr, args.Args)
-
-	// close the log channel, and wait for them all to be sent
-	close(logstream)
-	wg.Wait()
-
-	return err
+	return vtctl.RunCommand(stream.Context(), wr, args.Args)
 }
 
 // StartServer registers the VtctlServer for RPCs
 func StartServer(s *grpc.Server, ts topo.Server) {
-	if !servenv.ServiceMap["grpc-vtctl"] {
-		log.Infof("Disabling gRPC vtctl service")
-		return
-	}
-	pb.RegisterVtctlServer(s, NewVtctlServer(ts))
+	vtctlservicepb.RegisterVtctlServer(s, NewVtctlServer(ts))
 }

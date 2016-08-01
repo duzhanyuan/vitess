@@ -6,36 +6,41 @@ package main
 
 import (
 	"flag"
+	"math/rand"
+	"strings"
 	"time"
 
+	"golang.org/x/net/context"
+
 	log "github.com/golang/glog"
+
 	"github.com/youtube/vitess/go/exit"
+	"github.com/youtube/vitess/go/vt/discovery"
 	"github.com/youtube/vitess/go/vt/servenv"
 	"github.com/youtube/vitess/go/vt/topo"
+	"github.com/youtube/vitess/go/vt/topo/topoproto"
 	"github.com/youtube/vitess/go/vt/vtgate"
-	"github.com/youtube/vitess/go/vt/vtgate/planbuilder"
+
+	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
 )
 
 var (
-	cell               = flag.String("cell", "test_nj", "cell to use")
-	schemaFile         = flag.String("vschema_file", "", "JSON schema file")
-	retryDelay         = flag.Duration("retry-delay", 2*time.Millisecond, "retry delay")
-	retryCount         = flag.Int("retry-count", 2, "retry count")
-	connTimeoutTotal   = flag.Duration("conn-timeout-total", 3*time.Second, "vttablet connection timeout (total)")
-	connTimeoutPerConn = flag.Duration("conn-timeout-per-conn", 1500*time.Millisecond, "vttablet connection timeout (per connection)")
-	connLife           = flag.Duration("conn-life", 365*24*time.Hour, "average life of vttablet connections")
-	maxInFlight        = flag.Int("max-in-flight", 0, "maximum number of calls to allow simultaneously")
+	cell                   = flag.String("cell", "test_nj", "cell to use")
+	retryCount             = flag.Int("retry-count", 2, "retry count")
+	healthCheckConnTimeout = flag.Duration("healthcheck_conn_timeout", 3*time.Second, "healthcheck connection timeout")
+	healthCheckRetryDelay  = flag.Duration("healthcheck_retry_delay", 2*time.Millisecond, "health check retry delay")
+	healthCheckTimeout     = flag.Duration("healthcheck_timeout", time.Minute, "the health check timeout period")
+	tabletTypesToWait      = flag.String("tablet_types_to_wait", "", "wait till connected for specified tablet types during Gateway initialization")
 )
 
 var resilientSrvTopoServer *vtgate.ResilientSrvTopoServer
-var topoReader *TopoReader
+var healthCheck discovery.HealthCheck
+
+var initFakeZK func()
 
 func init() {
+	rand.Seed(time.Now().UnixNano())
 	servenv.RegisterDefaultFlags()
-	servenv.RegisterDefaultSecureFlags()
-	servenv.RegisterDefaultSocketFileFlags()
-	servenv.InitServiceMapForBsonRpcService("toporeader")
-	servenv.InitServiceMapForBsonRpcService("vtgateservice")
 }
 
 func main() {
@@ -44,46 +49,32 @@ func main() {
 	flag.Parse()
 	servenv.Init()
 
+	if initFakeZK != nil {
+		initFakeZK()
+	}
 	ts := topo.GetServer()
 	defer topo.CloseServers()
 
-	var schema *planbuilder.Schema
-	log.Info(*cell, *schemaFile)
-	if *schemaFile != "" {
-		var err error
-		if schema, err = planbuilder.LoadFile(*schemaFile); err != nil {
-			log.Error(err)
-			exit.Return(1)
-		}
-		log.Infof("v3 is enabled: loaded schema from file: %v", *schemaFile)
-	} else {
-		schemafier, ok := ts.(topo.Schemafier)
-		if !ok {
-			log.Infof("Skipping v3 initialization: topo does not suppurt schemafier interface")
-			goto startServer
-		}
-		schemaJSON, err := schemafier.GetVSchema()
-		if err != nil {
-			log.Warningf("Skipping v3 initialization: GetVSchema failed: %v", err)
-			goto startServer
-		}
-		schema, err = planbuilder.NewSchema([]byte(schemaJSON))
-		if err != nil {
-			log.Warningf("Skipping v3 initialization: GetVSchema failed: %v", err)
-			goto startServer
-		}
-		log.Infof("v3 is enabled: loaded schema from topo")
-	}
-
-startServer:
 	resilientSrvTopoServer = vtgate.NewResilientSrvTopoServer(ts, "ResilientSrvTopoServer")
 
-	// For the initial phase vtgate is exposing
-	// topoReader api. This will be subsumed by
-	// vtgate once vtgate's client functions become active.
-	topoReader = NewTopoReader(resilientSrvTopoServer)
-	servenv.Register("toporeader", topoReader)
+	healthCheck = discovery.NewHealthCheck(*healthCheckConnTimeout, *healthCheckRetryDelay, *healthCheckTimeout)
+	healthCheck.RegisterStats()
 
-	vtgate.Init(resilientSrvTopoServer, schema, *cell, *retryDelay, *retryCount, *connTimeoutTotal, *connTimeoutPerConn, *connLife, *maxInFlight)
+	tabletTypes := make([]topodatapb.TabletType, 0, 1)
+	if len(*tabletTypesToWait) != 0 {
+		for _, ttStr := range strings.Split(*tabletTypesToWait, ",") {
+			tt, err := topoproto.ParseTabletType(ttStr)
+			if err != nil {
+				log.Errorf("unknown tablet type: %v", ttStr)
+				continue
+			}
+			tabletTypes = append(tabletTypes, tt)
+		}
+	}
+	vtg := vtgate.Init(context.Background(), healthCheck, ts, resilientSrvTopoServer, *cell, *retryCount, tabletTypes)
+
+	servenv.OnRun(func() {
+		addStatusParts(vtg)
+	})
 	servenv.RunDefault()
 }

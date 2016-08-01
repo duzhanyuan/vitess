@@ -6,15 +6,21 @@ set -e
 
 cell='test'
 keyspace='test_keyspace'
-shard=0
-uid_base=100
-port_base=15100
-mysql_port_base=33100
+shard=${SHARD:-'0'}
+uid_base=${UID_BASE:-'100'}
+port_base=$[15000 + $uid_base]
+grpc_port_base=$[16000 + $uid_base]
+mysql_port_base=$[17000 + $uid_base]
+tablet_hostname=''
 
-hostname=`hostname -f`
+# Travis hostnames are too long for MySQL, so we use IP.
+# Otherwise, blank hostname means the tablet auto-detects FQDN.
+if [ "$TRAVIS" == true ]; then
+  tablet_hostname=`hostname -i`
+fi
 
-# We expect to find zk-client-conf.json in the same folder as this script.
 script_root=`dirname "${BASH_SOURCE}"`
+source $script_root/env.sh
 
 dbconfig_flags="\
     -db-config-app-uname vt_app \
@@ -28,55 +34,82 @@ dbconfig_flags="\
     -db-config-filtered-uname vt_filtered \
     -db-config-filtered-dbname vt_$keyspace \
     -db-config-filtered-charset utf8"
+init_db_sql_file="$VTROOT/config/init_db.sql"
 
-# Set up environment.
-export LD_LIBRARY_PATH=$VTROOT/dist/vt-zookeeper-3.3.5/lib:$LD_LIBRARY_PATH
-export ZK_CLIENT_CONFIG=$script_root/zk-client-conf.json
-export EXTRA_MY_CNF=$VTROOT/config/mycnf/master_mariadb.cnf
-mkdir -p $VTDATAROOT/tmp
-
-# Try to find mysqld_safe on PATH.
-if [ -z "$VT_MYSQL_ROOT" ]; then
-  mysql_path=`which mysqld_safe`
-  if [ -z "$mysql_path" ]; then
-    echo "Can't guess location of mysqld_safe. Please set VT_MYSQL_ROOT so it can be found at \$VT_MYSQL_ROOT/bin/mysqld_safe."
+case "$MYSQL_FLAVOR" in
+  "MySQL56")
+    export EXTRA_MY_CNF=$VTROOT/config/mycnf/master_mysql56.cnf
+    ;;
+  "MariaDB")
+    export EXTRA_MY_CNF=$VTROOT/config/mycnf/master_mariadb.cnf
+    ;;
+  *)
+    echo "Please set MYSQL_FLAVOR to MySQL56 or MariaDB."
     exit 1
-  fi
-  export VT_MYSQL_ROOT=$(dirname `dirname $mysql_path`)
-fi
+    ;;
+esac
 
-# Look for memcached.
-memcached_path=`which memcached`
-if [ -z "$memcached_path" ]; then
-  echo "Can't find memcached. Please make sure it is available in PATH."
-  exit 1
-fi
+mkdir -p $VTDATAROOT/backups
 
-# Start 3 vttablets.
-for uid_index in 0 1 2; do
+# Start 5 vttablets by default.
+# Pass a list of UID indices on the command line to override.
+uids=${@:-'0 1 2 3 4'}
+
+# Start all mysqlds in background.
+for uid_index in $uids; do
   uid=$[$uid_base + $uid_index]
-  port=$[$port_base + $uid_index]
   mysql_port=$[$mysql_port_base + $uid_index]
   printf -v alias '%s-%010d' $cell $uid
   printf -v tablet_dir 'vt_%010d' $uid
 
   echo "Starting MySQL for tablet $alias..."
-  $VTROOT/bin/mysqlctl -log_dir $VTDATAROOT/tmp -tablet_uid $uid $dbconfig_flags \
+  action="init -init_db_sql_file $init_db_sql_file"
+  if [ -d $VTDATAROOT/$tablet_dir ]; then
+    echo "Resuming from existing vttablet dir:"
+    echo "    $VTDATAROOT/$tablet_dir"
+    action='start'
+  fi
+  $VTROOT/bin/mysqlctl \
+    -log_dir $VTDATAROOT/tmp \
+    -tablet_uid $uid $dbconfig_flags \
     -mysql_port $mysql_port \
-    init -bootstrap_archive mysql-db-dir_10.0.13-MariaDB.tbz
+    $action &
+done
 
-  $VT_MYSQL_ROOT/bin/mysql -u vt_dba -S $VTDATAROOT/$tablet_dir/mysql.sock \
-    -e "CREATE DATABASE IF NOT EXISTS vt_$keyspace"
+# Wait for all mysqld to start up.
+wait
+
+# Start all vttablets in background.
+for uid_index in $uids; do
+  uid=$[$uid_base + $uid_index]
+  port=$[$port_base + $uid_index]
+  grpc_port=$[$grpc_port_base + $uid_index]
+  printf -v alias '%s-%010d' $cell $uid
+  printf -v tablet_dir 'vt_%010d' $uid
+  tablet_type=replica
+  if [[ $uid_index -gt 2 ]]; then
+    tablet_type=rdonly
+  fi
 
   echo "Starting vttablet for $alias..."
-  $VTROOT/bin/vttablet -log_dir $VTDATAROOT/tmp -port $port $dbconfig_flags \
+  $VTROOT/bin/vttablet \
+    -log_dir $VTDATAROOT/tmp \
     -tablet-path $alias \
+    -tablet_hostname "$tablet_hostname" \
     -init_keyspace $keyspace \
     -init_shard $shard \
-    -target_tablet_type replica \
-    -enable-rowcache \
-    -rowcache-bin $memcached_path \
-    -rowcache-socket $VTDATAROOT/$tablet_dir/memcache.sock \
+    -init_tablet_type $tablet_type \
+    -health_check_interval 5s \
+    -enable_semi_sync \
+    -enable_replication_reporter \
+    -backup_storage_implementation file \
+    -file_backup_storage_root $VTDATAROOT/backups \
+    -restore_from_backup \
+    -port $port \
+    -grpc_port $grpc_port \
+    -service_map 'grpc-queryservice,grpc-tabletmanager,grpc-updatestream' \
+    -pid_file $VTDATAROOT/$tablet_dir/vttablet.pid \
+    $dbconfig_flags \
     > $VTDATAROOT/$tablet_dir/vttablet.out 2>&1 &
 
   echo "Access tablet $alias at http://$hostname:$port/debug/status"

@@ -12,7 +12,7 @@ import (
 )
 
 func TestRegisterDialer(t *testing.T) {
-	dialerFunc := func(context.Context, string, time.Duration) (VTGateConn, error) {
+	dialerFunc := func(context.Context, string, time.Duration) (Impl, error) {
 		return nil, nil
 	}
 	RegisterDialer("test1", dialerFunc)
@@ -20,29 +20,19 @@ func TestRegisterDialer(t *testing.T) {
 }
 
 func TestGetDialerWithProtocol(t *testing.T) {
-	var protocol = "test2"
-	var dialerFunc = GetDialerWithProtocol(protocol)
-	if dialerFunc != nil {
-		t.Fatalf("protocol: %s is not registered, should return nil", protocol)
+	protocol := "test2"
+	c, err := DialProtocol(context.Background(), protocol, "", 0, "")
+	if err == nil || err.Error() != "no dialer registered for VTGate protocol "+protocol {
+		t.Fatalf("protocol: %s is not registered, should return error: %v", protocol, err)
 	}
-	RegisterDialer(protocol, func(context.Context, string, time.Duration) (VTGateConn, error) {
+	RegisterDialer(protocol, func(context.Context, string, time.Duration) (Impl, error) {
 		return nil, nil
 	})
-	dialerFunc = GetDialerWithProtocol(protocol)
-	if dialerFunc == nil {
-		t.Fatalf("dialerFunc has been registered, should not get nil")
+	c, err = DialProtocol(context.Background(), protocol, "", 0, "test_ks")
+	if err != nil || c == nil {
+		t.Fatalf("dialerFunc has been registered, should not get nil: %v %v", err, c)
 	}
-}
-
-func TestServerError(t *testing.T) {
-	serverError := &ServerError{Code: 12, Err: "error"}
-	if serverError.Error() == "" {
-		t.Fatalf("server error is not empty, should not return empty error")
-	}
-}
-
-func TestOperationalError(t *testing.T) {
-	if OperationalError("error").Error() == "" {
-		t.Fatal("operational error is not mepty, should not return empty error")
+	if c.keyspace != "test_ks" {
+		t.Errorf("not setting keyspace properly.")
 	}
 }

@@ -13,21 +13,21 @@ import (
 
 // QueryDetail is a simple wrapper for Query, Context and a killable conn.
 type QueryDetail struct {
-	context context.Context
-	conn    killable
-	connID  int64
-	start   time.Time
+	ctx    context.Context
+	conn   killable
+	connID int64
+	start  time.Time
 }
 
 type killable interface {
 	Current() string
 	ID() int64
-	Kill()
+	Kill(string) error
 }
 
 // NewQueryDetail creates a new QueryDetail
-func NewQueryDetail(context context.Context, conn killable) *QueryDetail {
-	return &QueryDetail{context: context, conn: conn, connID: conn.ID(), start: time.Now()}
+func NewQueryDetail(ctx context.Context, conn killable) *QueryDetail {
+	return &QueryDetail{ctx: ctx, conn: conn, connID: conn.ID(), start: time.Now()}
 }
 
 // QueryList holds a thread safe list of QueryDetails
@@ -63,7 +63,7 @@ func (ql *QueryList) Terminate(connID int64) error {
 	if qd == nil {
 		return fmt.Errorf("query %v not found", connID)
 	}
-	qd.conn.Kill()
+	qd.conn.Kill("QueryList.Terminate()")
 	return nil
 }
 
@@ -72,7 +72,7 @@ func (ql *QueryList) TerminateAll() {
 	ql.mu.Lock()
 	defer ql.mu.Unlock()
 	for _, qd := range ql.queryDetails {
-		qd.conn.Kill()
+		qd.conn.Kill("QueryList.TerminateAll()")
 	}
 }
 
@@ -98,14 +98,9 @@ func (ql *QueryList) GetQueryzRows() []QueryDetailzRow {
 	ql.mu.Lock()
 	rows := []QueryDetailzRow{}
 	for _, qd := range ql.queryDetails {
-		var h template.HTML
-		ci, ok := callinfo.FromContext(qd.context)
-		if ok {
-			h = ci.HTML()
-		}
 		row := QueryDetailzRow{
 			Query:       qd.conn.Current(),
-			ContextHTML: h,
+			ContextHTML: callinfo.HTMLFromContext(qd.ctx),
 			Start:       qd.start,
 			Duration:    time.Now().Sub(qd.start),
 			ConnID:      qd.connID,

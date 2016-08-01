@@ -13,70 +13,79 @@ import (
 
 	log "github.com/golang/glog"
 	"github.com/youtube/vitess/go/mysql"
+	"github.com/youtube/vitess/go/sqldb"
 	"github.com/youtube/vitess/go/tb"
 	"github.com/youtube/vitess/go/vt/logutil"
-)
-
-const (
-	// ErrFail is returned when a query fails
-	ErrFail = iota
-
-	// ErrRetry is returned when a query can be retried
-	ErrRetry
-
-	// ErrFatal is returned when a query cannot be retried
-	ErrFatal
-
-	// ErrTxPoolFull is returned when we can't get a connection
-	ErrTxPoolFull
-
-	// ErrNotInTx is returned when we're not in a transaction but should be
-	ErrNotInTx
+	vtrpcpb "github.com/youtube/vitess/go/vt/proto/vtrpc"
 )
 
 const (
 	maxErrLen = 5000
 )
 
+// ErrConnPoolClosed is returned / panicked when the connection pool is closed.
+var ErrConnPoolClosed = NewTabletError(
+	// connection pool being closed is not the query's fault, it can be retried on a
+	// different VtTablet.
+	vtrpcpb.ErrorCode_INTERNAL_ERROR,
+	"connection pool is closed")
+
 var logTxPoolFull = logutil.NewThrottledLogger("TxPoolFull", 1*time.Minute)
 
-// TabletError is the erro type we use in this library
+// TabletError is the error type we use in this library.
+// It implements vterrors.VtError interface.
 type TabletError struct {
-	ErrorType int
-	Message   string
-	SqlError  int
-}
-
-// This is how go-mysql exports its error number
-type hasNumber interface {
-	Number() int
+	Message  string
+	SQLError int
+	SQLState string
+	// ErrorCode will be used to transmit the error across RPC boundaries
+	ErrorCode vtrpcpb.ErrorCode
 }
 
 // NewTabletError returns a TabletError of the given type
-func NewTabletError(errorType int, format string, args ...interface{}) *TabletError {
+func NewTabletError(errCode vtrpcpb.ErrorCode, format string, args ...interface{}) *TabletError {
 	return &TabletError{
-		ErrorType: errorType,
 		Message:   printable(fmt.Sprintf(format, args...)),
+		ErrorCode: errCode,
 	}
 }
 
-// NewTabletErrorSql returns a TabletError based on the error
-func NewTabletErrorSql(errorType int, err error) *TabletError {
+// NewTabletErrorSQL returns a TabletError based on the error
+func NewTabletErrorSQL(errCode vtrpcpb.ErrorCode, err error) *TabletError {
 	var errnum int
 	errstr := err.Error()
-	if sqlErr, ok := err.(hasNumber); ok {
+	sqlState := sqldb.SQLStateGeneral
+	if sqlErr, ok := err.(*sqldb.SQLError); ok {
 		errnum = sqlErr.Number()
-		// Override error type if MySQL is in read-only mode. It's probably because
-		// there was a remaster and there are old clients still connected.
-		if errnum == mysql.ErrOptionPreventsStatement && strings.Contains(errstr, "read-only") {
-			errorType = ErrRetry
+		sqlState = sqlErr.SQLState()
+		switch errnum {
+		case mysql.ErrOptionPreventsStatement:
+			// Override error type if MySQL is in read-only mode. It's probably because
+			// there was a remaster and there are old clients still connected.
+			if strings.Contains(errstr, "read-only") {
+				errCode = vtrpcpb.ErrorCode_QUERY_NOT_SERVED
+			}
+		case mysql.ErrDupEntry:
+			errCode = vtrpcpb.ErrorCode_INTEGRITY_ERROR
+		default:
 		}
 	}
 	return &TabletError{
-		ErrorType: errorType,
 		Message:   printable(errstr),
-		SqlError:  errnum,
+		SQLError:  errnum,
+		SQLState:  sqlState,
+		ErrorCode: errCode,
 	}
+}
+
+// PrefixTabletError attempts to add a string prefix to a TabletError,
+// while preserving its ErrorCode. If the given error is not a
+// TabletError, a new TabletError is returned with the desired ErrorCode.
+func PrefixTabletError(errCode vtrpcpb.ErrorCode, err error, prefix string) error {
+	if terr, ok := err.(*TabletError); ok {
+		return NewTabletError(terr.ErrorCode, "%s%s", prefix, terr.Message)
+	}
+	return NewTabletError(errCode, "%s%s", prefix, err)
 }
 
 func printable(in string) string {
@@ -97,8 +106,8 @@ func IsConnErr(err error) bool {
 	var sqlError int
 	switch err := err.(type) {
 	case *TabletError:
-		sqlError = err.SqlError
-	case hasNumber:
+		sqlError = err.SQLError
+	case *sqldb.SQLError:
 		sqlError = err.Number()
 	default:
 		match := errExtract.FindStringSubmatch(err.Error())
@@ -111,8 +120,8 @@ func IsConnErr(err error) bool {
 			return false
 		}
 	}
-	// 2013 means that someone sniped the query.
-	if sqlError == 2013 {
+	// ErrServerLost means that someone sniped the query.
+	if sqlError == mysql.ErrServerLost {
 		return false
 	}
 	return sqlError >= 2000 && sqlError <= 2018
@@ -122,79 +131,102 @@ func (te *TabletError) Error() string {
 	return te.Prefix() + te.Message
 }
 
+// VtErrorCode returns the underlying Vitess error code
+func (te *TabletError) VtErrorCode() vtrpcpb.ErrorCode {
+	return te.ErrorCode
+}
+
+// Prefix returns the prefix for the error, like error, fatal, etc.
 func (te *TabletError) Prefix() string {
 	prefix := "error: "
-	switch te.ErrorType {
-	case ErrRetry:
+	switch te.ErrorCode {
+	case vtrpcpb.ErrorCode_QUERY_NOT_SERVED:
 		prefix = "retry: "
-	case ErrFatal:
+	case vtrpcpb.ErrorCode_INTERNAL_ERROR:
 		prefix = "fatal: "
-	case ErrTxPoolFull:
+	case vtrpcpb.ErrorCode_RESOURCE_EXHAUSTED:
 		prefix = "tx_pool_full: "
-	case ErrNotInTx:
+	case vtrpcpb.ErrorCode_NOT_IN_TX:
 		prefix = "not_in_tx: "
+	}
+	// Special case for killed queries.
+	if te.SQLError == mysql.ErrServerLost {
+		prefix = prefix + "the query was killed either because it timed out or was canceled: "
 	}
 	return prefix
 }
 
 // RecordStats will record the error in the proper stat bucket
-func (te *TabletError) RecordStats() {
-	switch te.ErrorType {
-	case ErrRetry:
-		infoErrors.Add("Retry", 1)
-	case ErrFatal:
-		infoErrors.Add("Fatal", 1)
-	case ErrTxPoolFull:
-		errorStats.Add("TxPoolFull", 1)
-	case ErrNotInTx:
-		errorStats.Add("NotInTx", 1)
+func (te *TabletError) RecordStats(queryServiceStats *QueryServiceStats) {
+	switch te.ErrorCode {
+	case vtrpcpb.ErrorCode_QUERY_NOT_SERVED:
+		queryServiceStats.InfoErrors.Add("Retry", 1)
+	case vtrpcpb.ErrorCode_INTERNAL_ERROR:
+		queryServiceStats.InfoErrors.Add("Fatal", 1)
+	case vtrpcpb.ErrorCode_RESOURCE_EXHAUSTED:
+		queryServiceStats.ErrorStats.Add("TxPoolFull", 1)
+	case vtrpcpb.ErrorCode_NOT_IN_TX:
+		queryServiceStats.ErrorStats.Add("NotInTx", 1)
 	default:
-		switch te.SqlError {
+		switch te.SQLError {
 		case mysql.ErrDupEntry:
-			infoErrors.Add("DupKey", 1)
+			queryServiceStats.InfoErrors.Add("DupKey", 1)
 		case mysql.ErrLockWaitTimeout, mysql.ErrLockDeadlock:
-			errorStats.Add("Deadlock", 1)
+			queryServiceStats.ErrorStats.Add("Deadlock", 1)
 		default:
-			errorStats.Add("Fail", 1)
+			queryServiceStats.ErrorStats.Add("Fail", 1)
 		}
 	}
 }
 
-func handleError(err *error, logStats *SQLQueryStats) {
+func handleError(err *error, logStats *LogStats, queryServiceStats *QueryServiceStats) {
+	var terr *TabletError
+	defer func() {
+		if logStats != nil {
+			logStats.Error = terr
+			logStats.Send()
+		}
+	}()
 	if x := recover(); x != nil {
 		terr, ok := x.(*TabletError)
 		if !ok {
 			log.Errorf("Uncaught panic:\n%v\n%s", x, tb.Stack(4))
-			*err = NewTabletError(ErrFail, "%v: uncaught panic", x)
-			internalErrors.Add("Panic", 1)
+			terr = NewTabletError(vtrpcpb.ErrorCode_UNKNOWN_ERROR, "%v: uncaught panic", x)
+			*err = terr
+			queryServiceStats.InternalErrors.Add("Panic", 1)
 			return
 		}
 		*err = terr
-		terr.RecordStats()
-		if terr.ErrorType == ErrRetry { // Retry errors are too spammy
+		terr.RecordStats(queryServiceStats)
+		switch terr.ErrorCode {
+		case vtrpcpb.ErrorCode_QUERY_NOT_SERVED:
+			// Retry errors are too spammy
 			return
-		}
-		if terr.ErrorType == ErrTxPoolFull {
+		case vtrpcpb.ErrorCode_RESOURCE_EXHAUSTED:
 			logTxPoolFull.Errorf("%v", terr)
-		} else {
-			log.Errorf("%v", terr)
+		default:
+			switch terr.SQLError {
+			// MySQL deadlock errors are (usually) due to client behavior, not server
+			// behavior, and therefore logged at the INFO level.
+			case mysql.ErrLockWaitTimeout, mysql.ErrLockDeadlock, mysql.ErrDataTooLong,
+				mysql.ErrDataOutOfRange, mysql.ErrBadNullError:
+				log.Infof("%v", terr)
+			default:
+				log.Errorf("%v", terr)
+			}
 		}
-	}
-	if logStats != nil {
-		logStats.Error = *err
-		logStats.Send()
 	}
 }
 
-func logError() {
+func logError(queryServiceStats *QueryServiceStats) {
 	if x := recover(); x != nil {
 		terr, ok := x.(*TabletError)
 		if !ok {
 			log.Errorf("Uncaught panic:\n%v\n%s", x, tb.Stack(4))
-			internalErrors.Add("Panic", 1)
+			queryServiceStats.InternalErrors.Add("Panic", 1)
 			return
 		}
-		if terr.ErrorType == ErrTxPoolFull {
+		if terr.ErrorCode == vtrpcpb.ErrorCode_RESOURCE_EXHAUSTED {
 			logTxPoolFull.Errorf("%v", terr)
 		} else {
 			log.Errorf("%v", terr)

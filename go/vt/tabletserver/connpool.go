@@ -5,7 +5,6 @@
 package tabletserver
 
 import (
-	"errors"
 	"sync"
 	"time"
 
@@ -16,12 +15,6 @@ import (
 	"golang.org/x/net/context"
 )
 
-var (
-	// ErrConnPoolClosed is returned / panicked when the
-	// connection pool is closed.
-	ErrConnPoolClosed = errors.New("connection pool is closed")
-)
-
 // ConnPool implements a custom connection pool for tabletserver.
 // It's similar to dbconnpool.ConnPool, but the connections it creates
 // come with built-in ability to kill in-flight queries. These connections
@@ -29,11 +22,13 @@ var (
 // Other than the connection type, ConnPool maintains an additional
 // pool of dba connections that are used to kill connections.
 type ConnPool struct {
-	mu          sync.Mutex
-	connections *pools.ResourcePool
-	capacity    int
-	idleTimeout time.Duration
-	dbaPool     *dbconnpool.ConnectionPool
+	mu                sync.Mutex
+	connections       *pools.ResourcePool
+	capacity          int
+	idleTimeout       time.Duration
+	dbaPool           *dbconnpool.ConnectionPool
+	queryServiceStats *QueryServiceStats
+	checker           MySQLChecker
 }
 
 // NewConnPool creates a new ConnPool. The name is used
@@ -41,21 +36,28 @@ type ConnPool struct {
 func NewConnPool(
 	name string,
 	capacity int,
-	idleTimeout time.Duration) *ConnPool {
+	idleTimeout time.Duration,
+	enablePublishStats bool,
+	queryServiceStats *QueryServiceStats,
+	checker MySQLChecker) *ConnPool {
 	cp := &ConnPool{
-		capacity:    capacity,
-		idleTimeout: idleTimeout,
-		dbaPool:     dbconnpool.NewConnectionPool("", 1, idleTimeout),
+		capacity:          capacity,
+		idleTimeout:       idleTimeout,
+		dbaPool:           dbconnpool.NewConnectionPool("", 1, idleTimeout),
+		queryServiceStats: queryServiceStats,
+		checker:           checker,
 	}
 	if name == "" {
 		return cp
 	}
-	stats.Publish(name+"Capacity", stats.IntFunc(cp.Capacity))
-	stats.Publish(name+"Available", stats.IntFunc(cp.Available))
-	stats.Publish(name+"MaxCap", stats.IntFunc(cp.MaxCap))
-	stats.Publish(name+"WaitCount", stats.IntFunc(cp.WaitCount))
-	stats.Publish(name+"WaitTime", stats.DurationFunc(cp.WaitTime))
-	stats.Publish(name+"IdleTimeout", stats.DurationFunc(cp.IdleTimeout))
+	if enablePublishStats {
+		stats.Publish(name+"Capacity", stats.IntFunc(cp.Capacity))
+		stats.Publish(name+"Available", stats.IntFunc(cp.Available))
+		stats.Publish(name+"MaxCap", stats.IntFunc(cp.MaxCap))
+		stats.Publish(name+"WaitCount", stats.IntFunc(cp.WaitCount))
+		stats.Publish(name+"WaitTime", stats.DurationFunc(cp.WaitTime))
+		stats.Publish(name+"IdleTimeout", stats.DurationFunc(cp.IdleTimeout))
+	}
 	return cp
 }
 
@@ -72,10 +74,10 @@ func (cp *ConnPool) Open(appParams, dbaParams *sqldb.ConnParams) {
 	defer cp.mu.Unlock()
 
 	f := func() (pools.Resource, error) {
-		return NewDBConn(cp, appParams, dbaParams)
+		return NewDBConn(cp, appParams, dbaParams, cp.queryServiceStats)
 	}
 	cp.connections = pools.NewResourcePool(f, cp.capacity, cp.capacity, cp.idleTimeout)
-	cp.dbaPool.Open(dbconnpool.DBConnectionCreator(dbaParams, mysqlStats))
+	cp.dbaPool.Open(dbconnpool.DBConnectionCreator(dbaParams, cp.queryServiceStats.MySQLStats))
 }
 
 // Close will close the pool and wait for connections to be returned before
@@ -103,20 +105,6 @@ func (cp *ConnPool) Get(ctx context.Context) (*DBConn, error) {
 	}
 	r, err := p.Get(ctx)
 	if err != nil {
-		return nil, err
-	}
-	return r.(*DBConn), nil
-}
-
-// TryGet returns a connection, or nil.
-// You must call Recycle on the DBConn once done.
-func (cp *ConnPool) TryGet() (*DBConn, error) {
-	p := cp.pool()
-	if p == nil {
-		return nil, ErrConnPoolClosed
-	}
-	r, err := p.TryGet()
-	if err != nil || r == nil {
 		return nil, err
 	}
 	return r.(*DBConn), nil
@@ -160,7 +148,7 @@ func (cp *ConnPool) SetIdleTimeout(idleTimeout time.Duration) {
 	cp.idleTimeout = idleTimeout
 }
 
-// StatsJSON returns the pool stats as a JSOn object.
+// StatsJSON returns the pool stats as a JSON object.
 func (cp *ConnPool) StatsJSON() string {
 	p := cp.pool()
 	if p == nil {

@@ -14,8 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/youtube/vitess/go/mysql/proto"
 	"github.com/youtube/vitess/go/pools"
+	"github.com/youtube/vitess/go/sqltypes"
 	"github.com/youtube/vitess/go/stats"
 	"golang.org/x/net/context"
 )
@@ -28,8 +28,8 @@ var (
 
 // PoolConnection is the interface implemented by users of this specialized pool.
 type PoolConnection interface {
-	ExecuteFetch(query string, maxrows int, wantfields bool) (*proto.QueryResult, error)
-	ExecuteStreamFetch(query string, callback func(*proto.QueryResult) error, streamBufferSize int) error
+	ExecuteFetch(query string, maxrows int, wantfields bool) (*sqltypes.Result, error)
+	ExecuteStreamFetch(query string, callback func(*sqltypes.Result) error, streamBufferSize int) error
 	ID() int64
 	Close()
 	IsClosed() bool
@@ -99,29 +99,13 @@ func (cp *ConnectionPool) Close() {
 
 // Get returns a connection.
 // You must call Recycle on the PoolConnection once done.
-func (cp *ConnectionPool) Get(timeout time.Duration) (PoolConnection, error) {
+func (cp *ConnectionPool) Get(ctx context.Context) (PoolConnection, error) {
 	p := cp.pool()
 	if p == nil {
 		return nil, ErrConnPoolClosed
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
 	r, err := p.Get(ctx)
 	if err != nil {
-		return nil, err
-	}
-	return r.(PoolConnection), nil
-}
-
-// TryGet returns a connection, or nil.
-// You must call Recycle on the PoolConnection once done.
-func (cp *ConnectionPool) TryGet() (PoolConnection, error) {
-	p := cp.pool()
-	if p == nil {
-		return nil, ErrConnPoolClosed
-	}
-	r, err := p.TryGet()
-	if err != nil || r == nil {
 		return nil, err
 	}
 	return r.(PoolConnection), nil

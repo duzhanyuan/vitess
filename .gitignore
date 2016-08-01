@@ -12,19 +12,27 @@
 tags
 
 # Eclipse files
+.classpath
 .project
+.pydevproject
 .settings/
 
-# cbson & other C build dirs
+# Godeps files
+/Godeps/_workspace/pkg
+/Godeps/_workspace/bin
+
+# Go vendored libs
+/vendor/*/
+
+# C build dirs
 **/build
 
 # mysql build dirs
 third_party/mysql
 
 # java target files
-java/vtocc-client/target
-java/vtocc-jdbc-driver/target
-third_party/acolyte
+/java/*/target/
+/java/*/bin/
 
 # intellij files
 *.iml
@@ -32,3 +40,20 @@ third_party/acolyte
 
 ## vitess.io preview site
 preview-vitess.io/
+
+# test.go output files
+_test/
+/test/stats.json
+
+# php downloaded dependencies
+/php/composer.phar
+/php/vendor
+
+# site-local example files
+/examples/kubernetes/config.sh
+
+#pom generated file
+/java/jdbc/dependency-reduced-pom.xml
+
+# generated protobuf files
+/go/vt/.proto.tmp

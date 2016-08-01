@@ -9,6 +9,9 @@ import (
 	"path"
 
 	"github.com/youtube/vitess/go/flagutil"
+
+	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
+	"github.com/youtube/vitess/go/vt/topo/topoproto"
 )
 
 const (
@@ -16,10 +19,10 @@ const (
 	rootPath           = "/vt"
 	cellsDirPath       = rootPath + "/cells"
 	keyspacesDirPath   = rootPath + "/keyspaces"
+	electionDirPath    = rootPath + "/election"
 	tabletsDirPath     = rootPath + "/tablets"
 	replicationDirPath = rootPath + "/replication"
 	servingDirPath     = rootPath + "/ns"
-	vschemaPath        = rootPath + "/vschema"
 
 	// Magic file names. Directories in etcd cannot have data. Files whose names
 	// begin with '_' are hidden from directory listings.
@@ -29,8 +32,8 @@ const (
 	tabletFilename           = dataFilename
 	shardReplicationFilename = dataFilename
 	srvKeyspaceFilename      = dataFilename
-	srvShardFilename         = dataFilename
-	endPointsFilename        = dataFilename
+
+	vschemaFilename = "_VSchema"
 )
 
 var (
@@ -53,6 +56,10 @@ func keyspaceFilePath(keyspace string) string {
 	return path.Join(keyspaceDirPath(keyspace), keyspaceFilename)
 }
 
+func vschemaFilePath(keyspace string) string {
+	return path.Join(keyspaceDirPath(keyspace), vschemaFilename)
+}
+
 func shardsDirPath(keyspace string) string {
 	return keyspaceDirPath(keyspace)
 }
@@ -65,16 +72,20 @@ func shardFilePath(keyspace, shard string) string {
 	return path.Join(shardDirPath(keyspace, shard), shardFilename)
 }
 
-func tabletDirPath(tablet string) string {
-	return path.Join(tabletsDirPath, tablet)
+func tabletDirPath(tabletAlias *topodatapb.TabletAlias) string {
+	return path.Join(tabletsDirPath, topoproto.TabletAliasString(tabletAlias))
 }
 
-func tabletFilePath(tablet string) string {
-	return path.Join(tabletDirPath(tablet), tabletFilename)
+func tabletFilePath(tabletAlias *topodatapb.TabletAlias) string {
+	return path.Join(tabletDirPath(tabletAlias), tabletFilename)
+}
+
+func keyspaceReplicationDirPath(keyspace string) string {
+	return path.Join(replicationDirPath, keyspace)
 }
 
 func shardReplicationDirPath(keyspace, shard string) string {
-	return path.Join(replicationDirPath, keyspace, shard)
+	return path.Join(keyspaceReplicationDirPath(keyspace), shard)
 }
 
 func shardReplicationFilePath(keyspace, shard string) string {
@@ -89,18 +100,10 @@ func srvKeyspaceFilePath(keyspace string) string {
 	return path.Join(srvKeyspaceDirPath(keyspace), srvKeyspaceFilename)
 }
 
-func srvShardDirPath(keyspace, shard string) string {
-	return path.Join(srvKeyspaceDirPath(keyspace), shard)
+func srvVSchemaDirPath() string {
+	return servingDirPath
 }
 
-func srvShardFilePath(keyspace, shard string) string {
-	return path.Join(srvShardDirPath(keyspace, shard), srvShardFilename)
-}
-
-func endPointsDirPath(keyspace, shard, tabletType string) string {
-	return path.Join(srvShardDirPath(keyspace, shard), tabletType)
-}
-
-func endPointsFilePath(keyspace, shard, tabletType string) string {
-	return path.Join(endPointsDirPath(keyspace, shard, tabletType), endPointsFilename)
+func srvVSchemaFilePath() string {
+	return path.Join(srvVSchemaDirPath(), vschemaFilename)
 }

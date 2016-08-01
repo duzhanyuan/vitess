@@ -1,115 +1,143 @@
+// Copyright 2015, Google Inc. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package tabletserver
 
 import (
-	"os"
 	"testing"
 	"time"
 
-	mproto "github.com/youtube/vitess/go/mysql/proto"
 	"github.com/youtube/vitess/go/sqldb"
-	"github.com/youtube/vitess/go/stats"
+	"github.com/youtube/vitess/go/vt/vttest/fakesqldb"
 	"golang.org/x/net/context"
 )
 
-var (
-	appParams = &sqldb.ConnParams{
-		Uname:      "vt_app",
-		DbName:     "sougou",
-		UnixSocket: os.Getenv("VTDATAROOT") + "/vt_0000062347/mysql.sock",
-		Charset:    "utf8",
-	}
-	dbaParams = &sqldb.ConnParams{
-		Uname:      "vt_dba",
-		DbName:     "sougou",
-		UnixSocket: os.Getenv("VTDATAROOT") + "/vt_0000062347/mysql.sock",
-		Charset:    "utf8",
-	}
-)
-
-// TestConnectivity is a manual test that requires code changes.
-// You first need to bring up a mysql instance to match the connection params.
-// Setup: mysqlctl -tablet_uid=62347 -mysql_port=15001 init.
-// Connect: mysql -S vt_0000062347/mysql.sock -u vt_dba
-// Initialize: create database sougou; use sougou; create table a(id int, primary key(id));
-// Run the test normally once. Then you add a 20s sleep in dbconn.execOnce
-// and run it again. You also have to check the code coverage to see that all critical
-// paths were covered.
-// Shutdown: mysqlctl -tablet_uid=62347 -mysql_port=15001 teardown
-// TODO(sougou): Figure out a way to automate this.
-func TestConnectivity(t *testing.T) {
-	t.Skip("manual test")
-	ctx := context.Background()
-	killStats = stats.NewCounters("TestKills")
-	internalErrors = stats.NewCounters("TestInternalErrors")
-	mysqlStats = stats.NewTimings("TestMySQLStats")
-	pool := NewConnPool("p1", 1, 30*time.Second)
-	pool.Open(appParams, dbaParams)
-
-	conn, err := pool.Get(ctx)
+func TestConnPoolGet(t *testing.T) {
+	db := fakesqldb.Register()
+	testUtils := newTestUtils()
+	appParams := &sqldb.ConnParams{Engine: db.Name}
+	dbaParams := &sqldb.ConnParams{Engine: db.Name}
+	connPool := testUtils.newConnPool()
+	connPool.Open(appParams, dbaParams)
+	defer connPool.Close()
+	dbConn, err := connPool.Get(context.Background())
 	if err != nil {
-		t.Error(err)
+		t.Fatalf("should get an error, but got: %v", err)
 	}
-	conn.Kill()
+	if dbConn == nil {
+		t.Fatalf("db conn should not be nil")
+	}
+	dbConn.Recycle()
+}
 
-	newctx, cancel := withTimeout(ctx, 2*time.Second)
-	_, err = conn.Exec(newctx, "select * from a", 1000, true)
-	cancel()
-	if err != nil {
-		t.Error(err)
-	}
-	conn.Close()
-
-	newctx, cancel = withTimeout(ctx, 2*time.Second)
-	_, err = conn.Exec(newctx, "select * from a", 1000, true)
-	cancel()
-	// You'll get a timedout error in slow mode. Otherwise, this should succeed.
-	timedout := "error: setDeadline: timed out"
-	if err != nil && err.Error() != timedout {
-		t.Errorf("got: %v, want nil or %s", err, timedout)
-	}
-	conn.Recycle()
-
-	conn, err = pool.Get(ctx)
-	if err != nil {
-		t.Error(err)
-	}
-	ch := make(chan bool)
-	go func() {
-		newctx, cancel = withTimeout(ctx, 2*time.Millisecond)
-		_, err = conn.Exec(newctx, "select sleep(1) from dual", 1000, true)
-		cancel()
-		lostConn := "error: Lost connection to MySQL server during query (errno 2013) during query: select sleep(1) from dual"
-		if err == nil || err.Error() != lostConn {
-			t.Errorf("got: %v, want %s", err, lostConn)
+func TestConnPoolPutWhilePoolIsClosed(t *testing.T) {
+	fakesqldb.Register()
+	testUtils := newTestUtils()
+	connPool := testUtils.newConnPool()
+	defer func() {
+		if recover() == nil {
+			t.Fatalf("pool is closed, should get an error")
 		}
-		ch <- true
 	}()
-	time.Sleep(40 * time.Millisecond)
-	conn.Kill()
-	<-ch
-	conn.Recycle()
+	connPool.Put(nil)
+}
 
-	conn, err = pool.Get(ctx)
-	if err != nil {
-		t.Error(err)
+func TestConnPoolSetCapacity(t *testing.T) {
+	db := fakesqldb.Register()
+	testUtils := newTestUtils()
+	appParams := &sqldb.ConnParams{Engine: db.Name}
+	dbaParams := &sqldb.ConnParams{Engine: db.Name}
+	connPool := testUtils.newConnPool()
+	connPool.Open(appParams, dbaParams)
+	defer connPool.Close()
+	err := connPool.SetCapacity(-10)
+	if err == nil {
+		t.Fatalf("set capacity should return error for negative capacity")
 	}
-	ch = make(chan bool)
-	go func() {
-		newctx, cancel = withTimeout(ctx, 2*time.Millisecond)
-		err = conn.Stream(newctx, "select sleep(1) from dual", func(*mproto.QueryResult) error {
-			return nil
-		}, 4096)
-		cancel()
-		lostConn := "Lost connection to MySQL server during query (errno 2013) during query: select sleep(1) from dual"
-		if err == nil || err.Error() != lostConn {
-			t.Errorf("got: %v, want %s", err, lostConn)
-		}
-		ch <- true
-	}()
-	time.Sleep(40 * time.Millisecond)
-	conn.Kill()
-	<-ch
-	conn.Recycle()
+	err = connPool.SetCapacity(10)
+	if err != nil {
+		t.Fatalf("set capacity should succeed")
+	}
+	if connPool.Capacity() != 10 {
+		t.Fatalf("capacity should be 10")
+	}
+}
 
-	pool.Close()
+func TestConnPoolStatJSON(t *testing.T) {
+	db := fakesqldb.Register()
+	testUtils := newTestUtils()
+	connPool := testUtils.newConnPool()
+	if connPool.StatsJSON() != "{}" {
+		t.Fatalf("pool is closed, stats json should be empty: {}")
+	}
+	appParams := &sqldb.ConnParams{Engine: db.Name}
+	dbaParams := &sqldb.ConnParams{Engine: db.Name}
+	connPool.Open(appParams, dbaParams)
+	defer connPool.Close()
+	statsJSON := connPool.StatsJSON()
+	if statsJSON == "" || statsJSON == "{}" {
+		t.Fatalf("stats json should not be empty")
+	}
+}
+
+func TestConnPoolStateWhilePoolIsClosed(t *testing.T) {
+	fakesqldb.Register()
+	testUtils := newTestUtils()
+	connPool := testUtils.newConnPool()
+	if connPool.Capacity() != 0 {
+		t.Fatalf("pool capacity should be 0 because it is still closed")
+	}
+	if connPool.Available() != 0 {
+		t.Fatalf("pool available connections should be 0 because it is still closed")
+	}
+	if connPool.MaxCap() != 0 {
+		t.Fatalf("pool max capacity should be 0 because it is still closed")
+	}
+	if connPool.WaitCount() != 0 {
+		t.Fatalf("pool wait count should be 0 because it is still closed")
+	}
+	if connPool.WaitTime() != 0 {
+		t.Fatalf("pool wait time should be 0 because it is still closed")
+	}
+	if connPool.IdleTimeout() != 0 {
+		t.Fatalf("pool idle timeout should be 0 because it is still closed")
+	}
+}
+
+func TestConnPoolStateWhilePoolIsOpen(t *testing.T) {
+	db := fakesqldb.Register()
+	testUtils := newTestUtils()
+	appParams := &sqldb.ConnParams{Engine: db.Name}
+	dbaParams := &sqldb.ConnParams{Engine: db.Name}
+	idleTimeout := 10 * time.Second
+	connPool := testUtils.newConnPool()
+	connPool.Open(appParams, dbaParams)
+	defer connPool.Close()
+	if connPool.Capacity() != 100 {
+		t.Fatalf("pool capacity should be 100")
+	}
+	if connPool.MaxCap() != 100 {
+		t.Fatalf("pool max capacity should be 100")
+	}
+	if connPool.WaitTime() != 0 {
+		t.Fatalf("pool wait time should be 0")
+	}
+	if connPool.WaitCount() != 0 {
+		t.Fatalf("pool wait count should be 0")
+	}
+	if connPool.IdleTimeout() != idleTimeout {
+		t.Fatalf("pool idle timeout should be 0")
+	}
+	if connPool.Available() != 100 {
+		t.Fatalf("pool available connections should be 100")
+	}
+	dbConn, _ := connPool.Get(context.Background())
+	if connPool.Available() != 99 {
+		t.Fatalf("pool available connections should be 99")
+	}
+	dbConn.Recycle()
+	if connPool.Available() != 100 {
+		t.Fatalf("pool available connections should be 100")
+	}
 }

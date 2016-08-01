@@ -6,7 +6,6 @@ package tabletserver
 
 import (
 	"net/http"
-	"sync"
 	"time"
 
 	log "github.com/golang/glog"
@@ -17,12 +16,10 @@ import (
 	"github.com/youtube/vitess/go/vt/dbconfigs"
 	"github.com/youtube/vitess/go/vt/dbconnpool"
 	"github.com/youtube/vitess/go/vt/logutil"
-	"github.com/youtube/vitess/go/vt/mysqlctl"
+	vtrpcpb "github.com/youtube/vitess/go/vt/proto/vtrpc"
+	"github.com/youtube/vitess/go/vt/tableacl"
+	"github.com/youtube/vitess/go/vt/tableacl/acl"
 )
-
-// spotCheckMultiplier determines the precision of the
-// spot check ratio: 1e6 == 6 digits
-const spotCheckMultiplier = 1e6
 
 // QueryEngine implements the core functionality of tabletserver.
 // It assumes that no requests will be sent to it before Open is
@@ -41,31 +38,39 @@ const spotCheckMultiplier = 1e6
 // TODO(sougou): Switch to error return scheme.
 type QueryEngine struct {
 	schemaInfo *SchemaInfo
-	dbconfigs  *dbconfigs.DBConfigs
+	config     Config
+	dbconfigs  dbconfigs.DBConfigs
 
 	// Pools
-	cachePool      *CachePool
 	connPool       *ConnPool
 	streamConnPool *ConnPool
 
 	// Services
 	txPool       *TxPool
 	consolidator *sync2.Consolidator
-	invalidator  *RowcacheInvalidator
 	streamQList  *QueryList
-	tasks        sync.WaitGroup
 
 	// Vars
-	queryTimeout     sync2.AtomicDuration
-	spotCheckFreq    sync2.AtomicInt64
 	strictMode       sync2.AtomicInt64
+	autoCommit       sync2.AtomicInt64
 	maxResultSize    sync2.AtomicInt64
 	maxDMLRows       sync2.AtomicInt64
 	streamBufferSize sync2.AtomicInt64
-	strictTableAcl   bool
+	// tableaclExemptCount count the number of accesses allowed
+	// based on membership in the superuser ACL
+	tableaclExemptCount  sync2.AtomicInt64
+	tableaclAllowed      *stats.MultiCounters
+	tableaclDenied       *stats.MultiCounters
+	tableaclPseudoDenied *stats.MultiCounters
+	strictTableAcl       bool
+	enableTableAclDryRun bool
+	exemptACL            acl.ACL
 
-	// loggers
+	// Loggers
 	accessCheckerLogger *logutil.ThrottledLogger
+
+	// Stats
+	queryServiceStats *QueryServiceStats
 }
 
 type compiledPlan struct {
@@ -75,30 +80,6 @@ type compiledPlan struct {
 	TransactionID int64
 }
 
-var (
-	// stats are globals to allow anybody to set them
-	mysqlStats     *stats.Timings
-	queryStats     *stats.Timings
-	waitStats      *stats.Timings
-	killStats      *stats.Counters
-	infoErrors     *stats.Counters
-	errorStats     *stats.Counters
-	internalErrors *stats.Counters
-	resultStats    *stats.Histogram
-	spotCheckCount *stats.Int
-	qpsRates       *stats.Rates
-
-	resultBuckets = []int64{0, 1, 5, 10, 50, 100, 500, 1000, 5000, 10000}
-
-	connPoolClosedErr = NewTabletError(ErrFatal, "connection pool is closed")
-)
-
-// CacheInvalidator provides the abstraction needed for an instant invalidation
-// vs. delayed invalidation in the case of in-transaction dmls
-type CacheInvalidator interface {
-	Delete(key string)
-}
-
 // Helper method for conn pools to convert errors
 func getOrPanic(ctx context.Context, pool *ConnPool) *DBConn {
 	conn, err := pool.Get(ctx)
@@ -106,100 +87,117 @@ func getOrPanic(ctx context.Context, pool *ConnPool) *DBConn {
 		return conn
 	}
 	if err == ErrConnPoolClosed {
-		panic(connPoolClosedErr)
+		panic(ErrConnPoolClosed)
 	}
-	panic(NewTabletErrorSql(ErrFatal, err))
+	// If there's a problem with getting a connection out of the pool, that is
+	// probably not due to the query itself. The query might succeed on a different
+	// tablet.
+	panic(NewTabletErrorSQL(vtrpcpb.ErrorCode_INTERNAL_ERROR, err))
 }
 
 // NewQueryEngine creates a new QueryEngine.
 // This is a singleton class.
 // You must call this only once.
-func NewQueryEngine(config Config) *QueryEngine {
-	qe := &QueryEngine{}
+func NewQueryEngine(checker MySQLChecker, config Config) *QueryEngine {
+	qe := &QueryEngine{config: config}
+	qe.queryServiceStats = NewQueryServiceStats(config.StatsPrefix, config.EnablePublishStats)
 	qe.schemaInfo = NewSchemaInfo(
-		config.QueryCacheSize,
 		config.StatsPrefix,
+		checker,
+		config.QueryCacheSize,
+		time.Duration(config.SchemaReloadTime*1e9),
+		time.Duration(config.IdleTimeout*1e9),
 		map[string]string{
 			debugQueryPlansKey: config.DebugURLPrefix + "/query_plans",
 			debugQueryStatsKey: config.DebugURLPrefix + "/query_stats",
-			debugTableStatsKey: config.DebugURLPrefix + "/table_stats",
 			debugSchemaKey:     config.DebugURLPrefix + "/schema",
+			debugQueryRulesKey: config.DebugURLPrefix + "/query_rules",
 		},
-		time.Duration(config.SchemaReloadTime*1e9),
-		time.Duration(config.IdleTimeout*1e9),
+		config.EnablePublishStats,
+		qe.queryServiceStats,
 	)
 
-	mysqlStats = stats.NewTimings(config.StatsPrefix + "Mysql")
-
-	// Pools
-	qe.cachePool = NewCachePool(
-		config.PoolNamePrefix+"Rowcache",
-		config.RowCache,
-		time.Duration(config.IdleTimeout*1e9),
-		config.DebugURLPrefix+"/memcache/",
-	)
 	qe.connPool = NewConnPool(
 		config.PoolNamePrefix+"ConnPool",
 		config.PoolSize,
 		time.Duration(config.IdleTimeout*1e9),
+		config.EnablePublishStats,
+		qe.queryServiceStats,
+		checker,
 	)
 	qe.streamConnPool = NewConnPool(
 		config.PoolNamePrefix+"StreamConnPool",
 		config.StreamPoolSize,
 		time.Duration(config.IdleTimeout*1e9),
+		config.EnablePublishStats,
+		qe.queryServiceStats,
+		checker,
 	)
 
-	// Services
 	qe.txPool = NewTxPool(
 		config.PoolNamePrefix+"TransactionPool",
 		config.StatsPrefix,
 		config.TransactionCap,
 		time.Duration(config.TransactionTimeout*1e9),
-		time.Duration(config.TxPoolTimeout*1e9),
 		time.Duration(config.IdleTimeout*1e9),
+		config.EnablePublishStats,
+		qe.queryServiceStats,
+		checker,
 	)
 	qe.consolidator = sync2.NewConsolidator()
 	http.Handle(config.DebugURLPrefix+"/consolidations", qe.consolidator)
-	qe.invalidator = NewRowcacheInvalidator(config.StatsPrefix, qe)
 	qe.streamQList = NewQueryList()
 
-	// Vars
-	qe.queryTimeout.Set(time.Duration(config.QueryTimeout * 1e9))
-	qe.spotCheckFreq = sync2.AtomicInt64(config.SpotCheckRatio * spotCheckMultiplier)
 	if config.StrictMode {
 		qe.strictMode.Set(1)
 	}
+	if config.EnableAutoCommit {
+		qe.autoCommit.Set(1)
+	}
 	qe.strictTableAcl = config.StrictTableAcl
-	qe.maxResultSize = sync2.AtomicInt64(config.MaxResultSize)
-	qe.maxDMLRows = sync2.AtomicInt64(config.MaxDMLRows)
-	qe.streamBufferSize = sync2.AtomicInt64(config.StreamBufferSize)
+	qe.enableTableAclDryRun = config.EnableTableAclDryRun
 
-	// loggers
+	if config.TableAclExemptACL != "" {
+		if f, err := tableacl.GetCurrentAclFactory(); err == nil {
+			if exemptACL, err := f.New([]string{config.TableAclExemptACL}); err == nil {
+				log.Infof("Setting Table ACL exempt rule for %v", config.TableAclExemptACL)
+				qe.exemptACL = exemptACL
+			} else {
+				log.Infof("Cannot build exempt ACL for table ACL: %v", err)
+			}
+		} else {
+			log.Infof("Cannot get current ACL Factory: %v", err)
+		}
+	}
+
+	qe.maxResultSize = sync2.NewAtomicInt64(int64(config.MaxResultSize))
+	qe.maxDMLRows = sync2.NewAtomicInt64(int64(config.MaxDMLRows))
+	qe.streamBufferSize = sync2.NewAtomicInt64(int64(config.StreamBufferSize))
+
 	qe.accessCheckerLogger = logutil.NewThrottledLogger("accessChecker", 1*time.Second)
 
-	// Stats
-	stats.Publish(config.StatsPrefix+"MaxResultSize", stats.IntFunc(qe.maxResultSize.Get))
-	stats.Publish(config.StatsPrefix+"MaxDMLRows", stats.IntFunc(qe.maxDMLRows.Get))
-	stats.Publish(config.StatsPrefix+"StreamBufferSize", stats.IntFunc(qe.streamBufferSize.Get))
-	stats.Publish(config.StatsPrefix+"QueryTimeout", stats.DurationFunc(qe.queryTimeout.Get))
-	queryStats = stats.NewTimings(config.StatsPrefix + "Queries")
-	qpsRates = stats.NewRates(config.StatsPrefix+"QPS", queryStats, 15, 60*time.Second)
-	waitStats = stats.NewTimings(config.StatsPrefix + "Waits")
-	killStats = stats.NewCounters(config.StatsPrefix + "Kills")
-	infoErrors = stats.NewCounters(config.StatsPrefix + "InfoErrors")
-	errorStats = stats.NewCounters(config.StatsPrefix + "Errors")
-	internalErrors = stats.NewCounters(config.StatsPrefix + "InternalErrors")
-	resultStats = stats.NewHistogram(config.StatsPrefix+"Results", resultBuckets)
-	stats.Publish(config.StatsPrefix+"RowcacheSpotCheckRatio", stats.FloatFunc(func() float64 {
-		return float64(qe.spotCheckFreq.Get()) / spotCheckMultiplier
-	}))
-	spotCheckCount = stats.NewInt(config.StatsPrefix + "RowcacheSpotCheckCount")
+	var tableACLAllowedName string
+	var tableACLDeniedName string
+	var tableACLPseudoDeniedName string
+	if config.EnablePublishStats {
+		stats.Publish(config.StatsPrefix+"MaxResultSize", stats.IntFunc(qe.maxResultSize.Get))
+		stats.Publish(config.StatsPrefix+"MaxDMLRows", stats.IntFunc(qe.maxDMLRows.Get))
+		stats.Publish(config.StatsPrefix+"StreamBufferSize", stats.IntFunc(qe.streamBufferSize.Get))
+		stats.Publish(config.StatsPrefix+"TableACLExemptCount", stats.IntFunc(qe.tableaclExemptCount.Get))
+		tableACLAllowedName = "TableACLAllowed"
+		tableACLDeniedName = "TableACLDenied"
+		tableACLPseudoDeniedName = "TableACLPseudoDenied"
+	}
+
+	qe.tableaclAllowed = stats.NewMultiCounters(tableACLAllowedName, []string{"TableName", "TableGroup", "PlanID", "Username"})
+	qe.tableaclDenied = stats.NewMultiCounters(tableACLDeniedName, []string{"TableName", "TableGroup", "PlanID", "Username"})
+	qe.tableaclPseudoDenied = stats.NewMultiCounters(tableACLPseudoDeniedName, []string{"TableName", "TableGroup", "PlanID", "Username"})
 
 	return qe
 }
 
 // Open must be called before sending requests to QueryEngine.
-func (qe *QueryEngine) Open(dbconfigs *dbconfigs.DBConfigs, schemaOverrides []SchemaOverride, mysqld *mysqlctl.Mysqld) {
+func (qe *QueryEngine) Open(dbconfigs dbconfigs.DBConfigs) {
 	qe.dbconfigs = dbconfigs
 	appParams := dbconfigs.App.ConnParams
 	// Create dba params based on App connection params
@@ -214,58 +212,19 @@ func (qe *QueryEngine) Open(dbconfigs *dbconfigs.DBConfigs, schemaOverrides []Sc
 	if qe.strictMode.Get() != 0 {
 		strictMode = true
 	}
-	if !strictMode && dbconfigs.App.EnableRowcache {
-		panic(NewTabletError(ErrFatal, "Rowcache cannot be enabled when queryserver-config-strict-mode is false"))
-	}
-	if dbconfigs.App.EnableRowcache {
-		qe.cachePool.Open()
-		log.Infof("rowcache is enabled")
-	} else {
-		// Invalidator should not be enabled if rowcache is not enabled.
-		dbconfigs.App.EnableInvalidator = false
-		log.Infof("rowcache is not enabled")
-	}
 
 	start := time.Now()
-	// schemaInfo depends on cachePool. Every table that has a rowcache
-	// points to the cachePool.
-	qe.schemaInfo.Open(&appParams, &dbaParams, schemaOverrides, qe.cachePool, strictMode)
+	qe.schemaInfo.Open(&dbaParams, strictMode)
 	log.Infof("Time taken to load the schema: %v", time.Now().Sub(start))
 
-	// Start the invalidator only after schema is loaded.
-	// This will allow qe to find the table info
-	// for the invalidation events that will start coming
-	// immediately.
-	if dbconfigs.App.EnableInvalidator {
-		qe.invalidator.Open(dbconfigs.App.DbName, mysqld)
-	}
 	qe.connPool.Open(&appParams, &dbaParams)
 	qe.streamConnPool.Open(&appParams, &dbaParams)
 	qe.txPool.Open(&appParams, &dbaParams)
 }
 
-// Launch launches the specified function inside a goroutine.
-// If Close or WaitForTxEmpty is called while a goroutine is running,
-// QueryEngine will not return until the existing functions have completed.
-// This functionality allows us to launch tasks with the assurance that
-// the QueryEngine will not be closed underneath us.
-func (qe *QueryEngine) Launch(f func()) {
-	qe.tasks.Add(1)
-	go func() {
-		defer func() {
-			qe.tasks.Done()
-			if x := recover(); x != nil {
-				internalErrors.Add("Task", 1)
-				log.Errorf("task error: %v", x)
-			}
-		}()
-		f()
-	}()
-}
-
-// CheckMySQL returns true if we can connect to MySQL.
-func (qe *QueryEngine) CheckMySQL() bool {
-	conn, err := dbconnpool.NewDBConnection(&qe.dbconfigs.App.ConnParams, mysqlStats)
+// IsMySQLReachable returns true if we can connect to MySQL.
+func (qe *QueryEngine) IsMySQLReachable() bool {
+	conn, err := dbconnpool.NewDBConnection(&qe.dbconfigs.App.ConnParams, qe.queryServiceStats.MySQLStats)
 	if err != nil {
 		if IsConnErr(err) {
 			return false
@@ -288,13 +247,9 @@ func (qe *QueryEngine) WaitForTxEmpty() {
 // You must ensure that no more queries will be sent
 // before calling Close.
 func (qe *QueryEngine) Close() {
-	qe.tasks.Wait()
 	// Close in reverse order of Open.
 	qe.txPool.Close()
 	qe.streamConnPool.Close()
 	qe.connPool.Close()
-	qe.invalidator.Close()
 	qe.schemaInfo.Close()
-	qe.cachePool.Close()
-	qe.dbconfigs = nil
 }

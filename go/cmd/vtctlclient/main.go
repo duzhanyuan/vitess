@@ -6,7 +6,7 @@ package main
 
 import (
 	"flag"
-	"fmt"
+	"os"
 	"time"
 
 	log "github.com/golang/glog"
@@ -14,15 +14,16 @@ import (
 	"github.com/youtube/vitess/go/vt/logutil"
 	"github.com/youtube/vitess/go/vt/vtctl/vtctlclient"
 	"golang.org/x/net/context"
+
+	logutilpb "github.com/youtube/vitess/go/vt/proto/logutil"
 )
 
 // The default values used by these flags cannot be taken from wrangler and
 // actionnode modules, as we do't want to depend on them at all.
 var (
-	actionTimeout   = flag.Duration("action_timeout", time.Hour, "timeout for the total command")
-	dialTimeout     = flag.Duration("dial_timeout", 30*time.Second, "time to wait for the dial phase")
-	lockWaitTimeout = flag.Duration("lock_wait_timeout", 10*time.Second, "time to wait for a topology server lock")
-	server          = flag.String("server", "", "server to use for connection")
+	actionTimeout = flag.Duration("action_timeout", time.Hour, "timeout for the total command")
+	dialTimeout   = flag.Duration("dial_timeout", 30*time.Second, "time to wait for the dial phase")
+	server        = flag.String("server", "", "server to use for connection")
 )
 
 func main() {
@@ -30,40 +31,16 @@ func main() {
 
 	flag.Parse()
 
-	// create the client
-	client, err := vtctlclient.New(*server, *dialTimeout)
+	logger := logutil.NewConsoleLogger()
+
+	err := vtctlclient.RunCommandAndWait(
+		context.Background(), *server, flag.Args(),
+		*dialTimeout, *actionTimeout,
+		func(e *logutilpb.Event) {
+			logutil.LogEvent(logger, e)
+		})
 	if err != nil {
-		log.Errorf("Cannot dial to server %v: %v", *server, err)
-		exit.Return(1)
-	}
-	defer client.Close()
-
-	// run the command
-	ctx, cancel := context.WithTimeout(context.Background(), *actionTimeout)
-	defer cancel()
-	c, errFunc := client.ExecuteVtctlCommand(ctx, flag.Args(), *actionTimeout, *lockWaitTimeout)
-	if err = errFunc(); err != nil {
-		log.Errorf("Cannot execute remote command: %v", err)
-		exit.Return(1)
-	}
-
-	// stream the result
-	for e := range c {
-		switch e.Level {
-		case logutil.LOGGER_INFO:
-			log.Info(e.String())
-		case logutil.LOGGER_WARNING:
-			log.Warning(e.String())
-		case logutil.LOGGER_ERROR:
-			log.Error(e.String())
-		case logutil.LOGGER_CONSOLE:
-			fmt.Print(e.Value)
-		}
-	}
-
-	// then display the overall error
-	if err = errFunc(); err != nil {
-		log.Errorf("Remote error: %v", err)
-		exit.Return(1)
+		log.Error(err)
+		os.Exit(1)
 	}
 }

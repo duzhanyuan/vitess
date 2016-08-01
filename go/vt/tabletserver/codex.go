@@ -6,12 +6,10 @@ package tabletserver
 
 import (
 	"bytes"
-	"encoding/base64"
 	"fmt"
-	"strings"
 
-	log "github.com/golang/glog"
 	"github.com/youtube/vitess/go/sqltypes"
+	vtrpcpb "github.com/youtube/vitess/go/vt/proto/vtrpc"
 	"github.com/youtube/vitess/go/vt/schema"
 	"github.com/youtube/vitess/go/vt/sqlparser"
 )
@@ -40,12 +38,13 @@ func buildValueList(tableInfo *TableInfo, pkValues []interface{}, bindVars map[s
 
 func resolvePKValues(tableInfo *TableInfo, pkValues []interface{}, bindVars map[string]interface{}) (resolved []interface{}, length int, err error) {
 	length = -1
-	setLength := func(list []sqltypes.Value) {
+	setLengthFunc := func(list []sqltypes.Value) error {
 		if length == -1 {
 			length = len(list)
 		} else if len(list) != length {
-			panic(fmt.Sprintf("mismatched lengths for values %v", pkValues))
+			return NewTabletError(vtrpcpb.ErrorCode_BAD_INPUT, "mismatched lengths for values %v", pkValues)
 		}
+		return nil
 	}
 	resolved = make([]interface{}, len(pkValues))
 	for i, val := range pkValues {
@@ -61,7 +60,9 @@ func resolvePKValues(tableInfo *TableInfo, pkValues []interface{}, bindVars map[
 				if err != nil {
 					return nil, 0, err
 				}
-				setLength(list)
+				if err := setLengthFunc(list); err != nil {
+					return nil, 0, err
+				}
 				resolved[i] = list
 			}
 		case []interface{}:
@@ -72,7 +73,9 @@ func resolvePKValues(tableInfo *TableInfo, pkValues []interface{}, bindVars map[
 					return nil, 0, err
 				}
 			}
-			setLength(list)
+			if err := setLengthFunc(list); err != nil {
+				return nil, 0, err
+			}
 			resolved[i] = list
 		default:
 			resolved[i], err = resolveValue(tableInfo.GetPKColumn(i), val, nil)
@@ -90,14 +93,14 @@ func resolvePKValues(tableInfo *TableInfo, pkValues []interface{}, bindVars map[
 func resolveListArg(col *schema.TableColumn, key string, bindVars map[string]interface{}) ([]sqltypes.Value, error) {
 	val, _, err := sqlparser.FetchBindVar(key, bindVars)
 	if err != nil {
-		return nil, NewTabletError(ErrFail, "%v", err)
+		return nil, NewTabletError(vtrpcpb.ErrorCode_BAD_INPUT, "%v", err)
 	}
 	list := val.([]interface{})
 	resolved := make([]sqltypes.Value, len(list))
 	for i, v := range list {
-		sqlval, err := sqltypes.BuildValue(v)
+		sqlval, err := sqltypes.BuildConverted(col.Type, v)
 		if err != nil {
-			return nil, NewTabletError(ErrFail, "%v", err)
+			return nil, NewTabletError(vtrpcpb.ErrorCode_BAD_INPUT, "%v", err)
 		}
 		if err = validateValue(col, sqlval); err != nil {
 			return nil, err
@@ -130,23 +133,16 @@ func buildSecondaryList(tableInfo *TableInfo, pkList [][]sqltypes.Value, seconda
 }
 
 func resolveValue(col *schema.TableColumn, value interface{}, bindVars map[string]interface{}) (result sqltypes.Value, err error) {
-	switch v := value.(type) {
-	case string:
-		val, _, err := sqlparser.FetchBindVar(v, bindVars)
+	if v, ok := value.(string); ok {
+		value, _, err = sqlparser.FetchBindVar(v, bindVars)
 		if err != nil {
-			return result, NewTabletError(ErrFail, "%v", err)
+			return result, NewTabletError(vtrpcpb.ErrorCode_BAD_INPUT, "%v", err)
 		}
-		sqlval, err := sqltypes.BuildValue(val)
-		if err != nil {
-			return result, NewTabletError(ErrFail, "%v", err)
-		}
-		result = sqlval
-	case sqltypes.Value:
-		result = v
-	default:
-		panic(fmt.Sprintf("incompatible value type %v", v))
 	}
-
+	result, err = sqltypes.BuildConverted(col.Type, value)
+	if err != nil {
+		return result, NewTabletError(vtrpcpb.ErrorCode_BAD_INPUT, "%v", err)
+	}
 	if err = validateValue(col, result); err != nil {
 		return result, err
 	}
@@ -155,7 +151,7 @@ func resolveValue(col *schema.TableColumn, value interface{}, bindVars map[strin
 
 func validateRow(tableInfo *TableInfo, columnNumbers []int, row []sqltypes.Value) error {
 	if len(row) != len(columnNumbers) {
-		return NewTabletError(ErrFail, "data inconsistency %d vs %d", len(row), len(columnNumbers))
+		return NewTabletError(vtrpcpb.ErrorCode_BAD_INPUT, "data inconsistency %d vs %d", len(row), len(columnNumbers))
 	}
 	for j, value := range row {
 		if err := validateValue(&tableInfo.Columns[columnNumbers[j]], value); err != nil {
@@ -170,62 +166,16 @@ func validateValue(col *schema.TableColumn, value sqltypes.Value) error {
 	if value.IsNull() {
 		return nil
 	}
-	switch col.Category {
-	case schema.CAT_NUMBER:
-		if !value.IsNumeric() {
-			return NewTabletError(ErrFail, "type mismatch, expecting numeric type for %v", value)
+	if sqltypes.IsIntegral(col.Type) {
+		if !value.IsIntegral() {
+			return NewTabletError(vtrpcpb.ErrorCode_BAD_INPUT, "type mismatch, expecting numeric type for %v for column: %v", value, col)
 		}
-	case schema.CAT_VARBINARY:
-		if !value.IsString() {
-			return NewTabletError(ErrFail, "type mismatch, expecting string type for %v", value)
+	} else if col.Type == sqltypes.VarBinary {
+		if !value.IsQuoted() {
+			return NewTabletError(vtrpcpb.ErrorCode_BAD_INPUT, "type mismatch, expecting string type for %v for column: %v", value, col)
 		}
 	}
 	return nil
-}
-
-// getLimit resolves the rowcount or offset of the limit clause value.
-// It returns -1 if it's not set.
-func getLimit(limit interface{}, bv map[string]interface{}) int64 {
-	switch lim := limit.(type) {
-	case string:
-		lookup, ok := bv[lim[1:]]
-		if !ok {
-			panic(NewTabletError(ErrFail, "missing bind var %s", lim))
-		}
-		var newlim int64
-		switch l := lookup.(type) {
-		case int64:
-			newlim = l
-		case int32:
-			newlim = int64(l)
-		case int:
-			newlim = int64(l)
-		default:
-			panic(NewTabletError(ErrFail, "want number type for %s, got %T", lim, lookup))
-		}
-		if newlim < 0 {
-			panic(NewTabletError(ErrFail, "negative limit %d", newlim))
-		}
-		return newlim
-	case int64:
-		return lim
-	default:
-		return -1
-	}
-}
-
-func buildKey(row []sqltypes.Value) (key string) {
-	buf := bytes.NewBuffer(make([]byte, 0, 32))
-	for i, pkValue := range row {
-		if pkValue.IsNull() {
-			return ""
-		}
-		pkValue.EncodeAscii(buf)
-		if i != len(row)-1 {
-			buf.WriteByte('.')
-		}
-	}
-	return buf.String()
 }
 
 func buildStreamComment(tableInfo *TableInfo, pkValueList [][]sqltypes.Value, secondaryList [][]sqltypes.Value) []byte {
@@ -233,7 +183,7 @@ func buildStreamComment(tableInfo *TableInfo, pkValueList [][]sqltypes.Value, se
 	fmt.Fprintf(buf, " /* _stream %s (", tableInfo.Name)
 	// We assume the first index exists, and is the pk
 	for _, pkName := range tableInfo.Indexes[0].Columns {
-		buf.WriteString(pkName)
+		buf.WriteString(pkName.Original())
 		buf.WriteString(" ")
 	}
 	buf.WriteString(")")
@@ -247,21 +197,11 @@ func buildPKValueList(buf *bytes.Buffer, tableInfo *TableInfo, pkValueList [][]s
 	for _, pkValues := range pkValueList {
 		buf.WriteString(" (")
 		for _, pkValue := range pkValues {
-			pkValue.EncodeAscii(buf)
+			pkValue.EncodeASCII(buf)
 			buf.WriteString(" ")
 		}
 		buf.WriteString(")")
 	}
-}
-
-func applyFilter(columnNumbers []int, input []sqltypes.Value) (output []sqltypes.Value) {
-	output = make([]sqltypes.Value, len(columnNumbers))
-	for colIndex, colPointer := range columnNumbers {
-		if colPointer >= 0 {
-			output[colIndex] = input[colPointer]
-		}
-	}
-	return output
 }
 
 func applyFilterWithPKDefaults(tableInfo *TableInfo, columnNumbers []int, input []sqltypes.Value) (output []sqltypes.Value) {
@@ -274,46 +214,6 @@ func applyFilterWithPKDefaults(tableInfo *TableInfo, columnNumbers []int, input 
 		}
 	}
 	return output
-}
-
-func validateKey(tableInfo *TableInfo, key string) (newKey string) {
-	if key == "" {
-		// TODO: Verify auto-increment table
-		return
-	}
-	pieces := strings.Split(key, ".")
-	if len(pieces) != len(tableInfo.PKColumns) {
-		// TODO: Verify auto-increment table
-		return ""
-	}
-	pkValues := make([]sqltypes.Value, len(tableInfo.PKColumns))
-	for i, piece := range pieces {
-		if piece[0] == '\'' {
-			s, err := base64.StdEncoding.DecodeString(piece[1 : len(piece)-1])
-			if err != nil {
-				log.Warningf("Error decoding key %s for table %s: %v", key, tableInfo.Name, err)
-				internalErrors.Add("Mismatch", 1)
-				return
-			}
-			pkValues[i] = sqltypes.MakeString(s)
-		} else if piece == "null" {
-			// TODO: Verify auto-increment table
-			return ""
-		} else {
-			n, err := sqltypes.BuildNumeric(piece)
-			if err != nil {
-				log.Warningf("Error decoding key %s for table %s: %v", key, tableInfo.Name, err)
-				internalErrors.Add("Mismatch", 1)
-				return
-			}
-			pkValues[i] = n
-		}
-	}
-	if newKey = buildKey(pkValues); newKey != key {
-		log.Warningf("Error: Key mismatch, received: %s, computed: %s", key, newKey)
-		internalErrors.Add("Mismatch", 1)
-	}
-	return newKey
 }
 
 // unicoded returns a valid UTF-8 string that json won't reject

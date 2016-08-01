@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	zookeeper "github.com/samuel/go-zookeeper/zk"
 	"golang.org/x/net/context"
 
 	"github.com/youtube/vitess/go/vt/topo"
@@ -16,88 +17,40 @@ import (
 	"github.com/youtube/vitess/go/vt/zktopo"
 	"github.com/youtube/vitess/go/zk"
 	"github.com/youtube/vitess/go/zk/fakezk"
-	"launchpad.net/gozk/zookeeper"
 )
 
 type fakeServer struct {
-	topo.Server
+	topo.Impl
 	localCells []string
 }
 
-func (s fakeServer) GetKnownCells() ([]string, error) {
+func (s fakeServer) GetKnownCells(ctx context.Context) ([]string, error) {
 	return s.localCells, nil
 }
 
-func newFakeTeeServer(t *testing.T) topo.Server {
+func newFakeTeeServer(t *testing.T) topo.Impl {
 	cells := []string{"test", "global"} // global has to be last
 
 	zconn1 := fakezk.NewConn()
 	zconn2 := fakezk.NewConn()
 
 	for _, cell := range cells {
-		if _, err := zk.CreateRecursive(zconn1, fmt.Sprintf("/zk/%v/vt", cell), "", 0, zookeeper.WorldACL(zookeeper.PERM_ALL)); err != nil {
+		if _, err := zk.CreateRecursive(zconn1, fmt.Sprintf("/zk/%v/vt", cell), "", 0, zookeeper.WorldACL(zookeeper.PermAll)); err != nil {
 			t.Fatalf("cannot init ZooKeeper: %v", err)
 		}
-		if _, err := zk.CreateRecursive(zconn2, fmt.Sprintf("/zk/%v/vt", cell), "", 0, zookeeper.WorldACL(zookeeper.PERM_ALL)); err != nil {
+		if _, err := zk.CreateRecursive(zconn2, fmt.Sprintf("/zk/%v/vt", cell), "", 0, zookeeper.WorldACL(zookeeper.PermAll)); err != nil {
 			t.Fatalf("cannot init ZooKeeper: %v", err)
 		}
 	}
-	s1 := fakeServer{Server: zktopo.NewServer(zconn1), localCells: cells[:len(cells)-1]}
-	s2 := fakeServer{Server: zktopo.NewServer(zconn2), localCells: cells[:len(cells)-1]}
+	s1 := fakeServer{Impl: zktopo.NewServer(zconn1), localCells: cells[:len(cells)-1]}
+	s2 := fakeServer{Impl: zktopo.NewServer(zconn2), localCells: cells[:len(cells)-1]}
 
 	return NewTee(s1, s2, false)
 }
 
-func TestKeyspace(t *testing.T) {
-	ts := newFakeTeeServer(t)
-	test.CheckKeyspace(t, ts)
-}
-
-func TestShard(t *testing.T) {
-	ts := newFakeTeeServer(t)
-	test.CheckShard(context.Background(), t, ts)
-}
-
-func TestTablet(t *testing.T) {
-	ts := newFakeTeeServer(t)
-	test.CheckTablet(context.Background(), t, ts)
-}
-
-func TestServingGraph(t *testing.T) {
-	ts := newFakeTeeServer(t)
-	test.CheckServingGraph(context.Background(), t, ts)
-}
-
-func TestWatchEndPoints(t *testing.T) {
+func TestTeeTopo(t *testing.T) {
 	zktopo.WatchSleepDuration = 2 * time.Millisecond
-	ts := newFakeTeeServer(t)
-	test.CheckWatchEndPoints(context.Background(), t, ts)
-}
-
-func TestShardReplication(t *testing.T) {
-	ts := newFakeTeeServer(t)
-	test.CheckShardReplication(t, ts)
-}
-
-func TestKeyspaceLock(t *testing.T) {
-	ts := newFakeTeeServer(t)
-	test.CheckKeyspaceLock(t, ts)
-}
-
-func TestShardLock(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping wait-based test in short mode.")
-	}
-
-	ts := newFakeTeeServer(t)
-	test.CheckShardLock(t, ts)
-}
-
-func TestSrvShardLock(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping wait-based test in short mode.")
-	}
-
-	ts := newFakeTeeServer(t)
-	test.CheckSrvShardLock(t, ts)
+	test.TopoServerTestSuite(t, func() topo.Impl {
+		return newFakeTeeServer(t)
+	})
 }

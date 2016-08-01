@@ -6,7 +6,6 @@
 package grpcvtctlclient
 
 import (
-	"io"
 	"time"
 
 	"github.com/youtube/vitess/go/vt/logutil"
@@ -14,21 +13,23 @@ import (
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 
-	pb "github.com/youtube/vitess/go/vt/proto/vtctl"
+	logutilpb "github.com/youtube/vitess/go/vt/proto/logutil"
+	vtctldatapb "github.com/youtube/vitess/go/vt/proto/vtctldata"
+	vtctlservicepb "github.com/youtube/vitess/go/vt/proto/vtctlservice"
 )
 
 type gRPCVtctlClient struct {
 	cc *grpc.ClientConn
-	c  pb.VtctlClient
+	c  vtctlservicepb.VtctlClient
 }
 
 func gRPCVtctlClientFactory(addr string, dialTimeout time.Duration) (vtctlclient.VtctlClient, error) {
 	// create the RPC client
-	cc, err := grpc.Dial(addr)
+	cc, err := grpc.Dial(addr, grpc.WithInsecure(), grpc.WithBlock(), grpc.WithTimeout(dialTimeout))
 	if err != nil {
 		return nil, err
 	}
-	c := pb.NewVtctlClient(cc)
+	c := vtctlservicepb.NewVtctlClient(cc)
 
 	return &gRPCVtctlClient{
 		cc: cc,
@@ -36,43 +37,30 @@ func gRPCVtctlClientFactory(addr string, dialTimeout time.Duration) (vtctlclient
 	}, nil
 }
 
+type eventStreamAdapter struct {
+	stream vtctlservicepb.Vtctl_ExecuteVtctlCommandClient
+}
+
+func (e *eventStreamAdapter) Recv() (*logutilpb.Event, error) {
+	le, err := e.stream.Recv()
+	if err != nil {
+		return nil, err
+	}
+	return le.Event, nil
+}
+
 // ExecuteVtctlCommand is part of the VtctlClient interface
-func (client *gRPCVtctlClient) ExecuteVtctlCommand(ctx context.Context, args []string, actionTimeout, lockTimeout time.Duration) (<-chan *logutil.LoggerEvent, vtctlclient.ErrFunc) {
-	query := &pb.ExecuteVtctlCommandArgs{
+func (client *gRPCVtctlClient) ExecuteVtctlCommand(ctx context.Context, args []string, actionTimeout time.Duration) (logutil.EventStream, error) {
+	query := &vtctldatapb.ExecuteVtctlCommandRequest{
 		Args:          args,
 		ActionTimeout: int64(actionTimeout.Nanoseconds()),
-		LockTimeout:   int64(lockTimeout.Nanoseconds()),
 	}
 
 	stream, err := client.c.ExecuteVtctlCommand(ctx, query)
 	if err != nil {
-		return nil, func() error { return err }
+		return nil, err
 	}
-
-	results := make(chan *logutil.LoggerEvent, 1)
-	var finalError error
-	go func() {
-		for {
-			le, err := stream.Recv()
-			if err != nil {
-				if err != io.EOF {
-					finalError = err
-				}
-				close(results)
-				return
-			}
-			results <- &logutil.LoggerEvent{
-				Time:  time.Unix(le.Time.Seconds, le.Time.Nanoseconds),
-				Level: int(le.Level),
-				File:  le.File,
-				Line:  int(le.Line),
-				Value: le.Value,
-			}
-		}
-	}()
-	return results, func() error {
-		return finalError
-	}
+	return &eventStreamAdapter{stream}, nil
 }
 
 // Close is part of the VtctlClient interface

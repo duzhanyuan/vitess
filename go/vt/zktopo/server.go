@@ -9,10 +9,10 @@ import (
 	"path"
 	"sort"
 
-	"github.com/youtube/vitess/go/stats"
+	zookeeper "github.com/samuel/go-zookeeper/zk"
+
 	"github.com/youtube/vitess/go/vt/topo"
 	"github.com/youtube/vitess/go/zk"
-	"launchpad.net/gozk/zookeeper"
 )
 
 // Server is the zookeeper topo.Server implementation.
@@ -33,14 +33,13 @@ func (zkts *Server) GetZConn() zk.Conn {
 // NewServer can be used to create a custom Server
 // (for tests for instance) but it cannot change the globally
 // registered one.
-func NewServer(zconn zk.Conn) *Server {
+func NewServer(zconn zk.Conn) topo.Impl {
 	return &Server{zconn: zconn}
 }
 
 func init() {
 	zconn := zk.NewMetaConn()
-	stats.PublishJSONFunc("ZkMetaConn", zconn.String)
-	topo.RegisterServer("zookeeper", NewServer(zconn))
+	topo.RegisterServer("zookeeper", &Server{zconn: zconn})
 }
 
 //
@@ -61,7 +60,7 @@ func (zkts *Server) PurgeActions(zkActionPath string, canBePurged func(data stri
 
 	children, _, err := zkts.zconn.Children(zkActionPath)
 	if err != nil {
-		return err
+		return convertError(err)
 	}
 
 	sort.Strings(children)
@@ -69,7 +68,7 @@ func (zkts *Server) PurgeActions(zkActionPath string, canBePurged func(data stri
 	for i := len(children) - 1; i >= 0; i-- {
 		actionPath := path.Join(zkActionPath, children[i])
 		data, _, err := zkts.zconn.Get(actionPath)
-		if err != nil && !zookeeper.IsError(err, zookeeper.ZNONODE) {
+		if err != nil && err != zookeeper.ErrNoNode {
 			return fmt.Errorf("PurgeActions(%v) err: %v", zkActionPath, err)
 		}
 		if !canBePurged(data) {
@@ -77,7 +76,7 @@ func (zkts *Server) PurgeActions(zkActionPath string, canBePurged func(data stri
 		}
 
 		err = zk.DeleteRecursive(zkts.zconn, actionPath, -1)
-		if err != nil && !zookeeper.IsError(err, zookeeper.ZNONODE) {
+		if err != nil && err != zookeeper.ErrNoNode {
 			return fmt.Errorf("PurgeActions(%v) err: %v", zkActionPath, err)
 		}
 	}
@@ -97,7 +96,7 @@ func (zkts *Server) PruneActionLogs(zkActionLogPath string, keepCount int) (prun
 	// get sorted list of children
 	children, _, err := zkts.zconn.Children(zkActionLogPath)
 	if err != nil {
-		return 0, err
+		return 0, convertError(err)
 	}
 	sort.Strings(children)
 

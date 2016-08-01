@@ -6,6 +6,7 @@ package testlib
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,124 +15,114 @@ import (
 	"github.com/youtube/vitess/go/event"
 	"github.com/youtube/vitess/go/vt/logutil"
 	"github.com/youtube/vitess/go/vt/tabletmanager"
-	_ "github.com/youtube/vitess/go/vt/tabletmanager/gorpctmclient"
 	"github.com/youtube/vitess/go/vt/tabletmanager/tmclient"
 	"github.com/youtube/vitess/go/vt/topo"
+	"github.com/youtube/vitess/go/vt/topo/topoproto"
 	"github.com/youtube/vitess/go/vt/topotools"
 	"github.com/youtube/vitess/go/vt/topotools/events"
+	"github.com/youtube/vitess/go/vt/vttest/fakesqldb"
 	"github.com/youtube/vitess/go/vt/wrangler"
-	"github.com/youtube/vitess/go/vt/zktopo"
+	"github.com/youtube/vitess/go/vt/zktopo/zktestserver"
+
+	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
 )
 
 func TestTabletExternallyReparented(t *testing.T) {
-	testTabletExternallyReparented(t, false /* falst */)
-}
-
-func TestTabletExternallyReparentedFast(t *testing.T) {
-	testTabletExternallyReparented(t, true /* fast */)
-}
-
-func testTabletExternallyReparented(t *testing.T, fast bool) {
-	tabletmanager.SetReparentFlags(fast, time.Minute /* finalizeTimeout */)
+	tabletmanager.SetReparentFlags(time.Minute /* finalizeTimeout */)
 
 	ctx := context.Background()
-	ts := zktopo.NewTestServer(t, []string{"cell1", "cell2"})
-	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient(), time.Second)
+	db := fakesqldb.Register()
+	ts := zktestserver.New(t, []string{"cell1", "cell2"})
+	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
+	vp := NewVtctlPipe(t, ts)
+	defer vp.Close()
 
 	// Create an old master, a new master, two good slaves, one bad slave
-	oldMaster := NewFakeTablet(t, wr, "cell1", 0, topo.TYPE_MASTER)
-	newMaster := NewFakeTablet(t, wr, "cell1", 1, topo.TYPE_REPLICA,
-		TabletParent(oldMaster.Tablet.Alias))
-	goodSlave1 := NewFakeTablet(t, wr, "cell1", 2, topo.TYPE_REPLICA,
-		TabletParent(oldMaster.Tablet.Alias))
-	goodSlave2 := NewFakeTablet(t, wr, "cell2", 3, topo.TYPE_REPLICA,
-		TabletParent(oldMaster.Tablet.Alias))
-	badSlave := NewFakeTablet(t, wr, "cell1", 4, topo.TYPE_REPLICA,
-		TabletParent(oldMaster.Tablet.Alias))
+	oldMaster := NewFakeTablet(t, wr, "cell1", 0, topodatapb.TabletType_MASTER, db)
+	newMaster := NewFakeTablet(t, wr, "cell1", 1, topodatapb.TabletType_REPLICA, db)
+	goodSlave1 := NewFakeTablet(t, wr, "cell1", 2, topodatapb.TabletType_REPLICA, db)
+	goodSlave2 := NewFakeTablet(t, wr, "cell2", 3, topodatapb.TabletType_REPLICA, db)
+	badSlave := NewFakeTablet(t, wr, "cell1", 4, topodatapb.TabletType_REPLICA, db)
 
 	// Add a new Cell to the Shard, that doesn't map to any read topo cell,
 	// to simulate a data center being unreachable.
-	si, err := ts.GetShard("test_keyspace", "0")
+	_, err := ts.UpdateShardFields(ctx, "test_keyspace", "0", func(si *topo.ShardInfo) error {
+		if !si.HasCell("cell666") {
+			si.Cells = append(si.Cells, "cell666")
+		}
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("GetShard failed: %v", err)
-	}
-	si.Cells = append(si.Cells, "cell666")
-	if err := topo.UpdateShard(ctx, ts, si); err != nil {
-		t.Fatalf("UpdateShard failed: %v", err)
+		t.Fatalf("UpdateShardFields failed: %v", err)
 	}
 
 	// Slightly unrelated test: make sure we can find the tablets
 	// even with a datacenter being down.
-	tabletMap, err := topo.GetTabletMapForShardByCell(ctx, ts, "test_keyspace", "0", []string{"cell1"})
+	tabletMap, err := ts.GetTabletMapForShardByCell(ctx, "test_keyspace", "0", []string{"cell1"})
 	if err != nil {
 		t.Fatalf("GetTabletMapForShardByCell should have worked but got: %v", err)
 	}
-	master, err := topotools.FindTabletByIPAddrAndPort(tabletMap, oldMaster.Tablet.IPAddr, "vt", oldMaster.Tablet.Portmap["vt"])
-	if err != nil || master != oldMaster.Tablet.Alias {
+	master, err := topotools.FindTabletByIPAddrAndPort(tabletMap, oldMaster.Tablet.Ip, "vt", oldMaster.Tablet.PortMap["vt"])
+	if err != nil || !topoproto.TabletAliasEqual(&master, oldMaster.Tablet.Alias) {
 		t.Fatalf("FindTabletByIPAddrAndPort(master) failed: %v %v", err, master)
 	}
-	slave1, err := topotools.FindTabletByIPAddrAndPort(tabletMap, goodSlave1.Tablet.IPAddr, "vt", goodSlave1.Tablet.Portmap["vt"])
-	if err != nil || slave1 != goodSlave1.Tablet.Alias {
+	slave1, err := topotools.FindTabletByIPAddrAndPort(tabletMap, goodSlave1.Tablet.Ip, "vt", goodSlave1.Tablet.PortMap["vt"])
+	if err != nil || !topoproto.TabletAliasEqual(&slave1, goodSlave1.Tablet.Alias) {
 		t.Fatalf("FindTabletByIPAddrAndPort(slave1) failed: %v %v", err, master)
 	}
-	slave2, err := topotools.FindTabletByIPAddrAndPort(tabletMap, goodSlave2.Tablet.IPAddr, "vt", goodSlave2.Tablet.Portmap["vt"])
+	slave2, err := topotools.FindTabletByIPAddrAndPort(tabletMap, goodSlave2.Tablet.Ip, "vt", goodSlave2.Tablet.PortMap["vt"])
 	if err != topo.ErrNoNode {
 		t.Fatalf("FindTabletByIPAddrAndPort(slave2) worked: %v %v", err, slave2)
 	}
 
 	// Make sure the master is not exported in other cells
-	tabletMap, err = topo.GetTabletMapForShardByCell(ctx, ts, "test_keyspace", "0", []string{"cell2"})
-	master, err = topotools.FindTabletByIPAddrAndPort(tabletMap, oldMaster.Tablet.IPAddr, "vt", oldMaster.Tablet.Portmap["vt"])
+	tabletMap, err = ts.GetTabletMapForShardByCell(ctx, "test_keyspace", "0", []string{"cell2"})
+	master, err = topotools.FindTabletByIPAddrAndPort(tabletMap, oldMaster.Tablet.Ip, "vt", oldMaster.Tablet.PortMap["vt"])
 	if err != topo.ErrNoNode {
 		t.Fatalf("FindTabletByIPAddrAndPort(master) worked in cell2: %v %v", err, master)
 	}
 
-	tabletMap, err = topo.GetTabletMapForShard(ctx, ts, "test_keyspace", "0")
+	tabletMap, err = ts.GetTabletMapForShard(ctx, "test_keyspace", "0")
 	if err != topo.ErrPartialResult {
 		t.Fatalf("GetTabletMapForShard should have returned ErrPartialResult but got: %v", err)
 	}
-	master, err = topotools.FindTabletByIPAddrAndPort(tabletMap, oldMaster.Tablet.IPAddr, "vt", oldMaster.Tablet.Portmap["vt"])
-	if err != nil || master != oldMaster.Tablet.Alias {
+	master, err = topotools.FindTabletByIPAddrAndPort(tabletMap, oldMaster.Tablet.Ip, "vt", oldMaster.Tablet.PortMap["vt"])
+	if err != nil || !topoproto.TabletAliasEqual(&master, oldMaster.Tablet.Alias) {
 		t.Fatalf("FindTabletByIPAddrAndPort(master) failed: %v %v", err, master)
 	}
 
 	// On the elected master, we will respond to
-	// TABLET_ACTION_SLAVE_WAS_PROMOTED
-	newMaster.FakeMysqlDaemon.MasterAddr = ""
+	// TabletActionSlaveWasPromoted
 	newMaster.StartActionLoop(t, wr)
 	defer newMaster.StopActionLoop(t)
 
 	// On the old master, we will only respond to
-	// TABLET_ACTION_SLAVE_WAS_RESTARTED.
-	oldMaster.FakeMysqlDaemon.MasterAddr = newMaster.Tablet.MysqlIPAddr()
+	// TabletActionSlaveWasRestarted.
 	oldMaster.StartActionLoop(t, wr)
 	defer oldMaster.StopActionLoop(t)
 
 	// On the good slaves, we will respond to
-	// TABLET_ACTION_SLAVE_WAS_RESTARTED.
-	goodSlave1.FakeMysqlDaemon.MasterAddr = newMaster.Tablet.MysqlIPAddr()
+	// TabletActionSlaveWasRestarted.
 	goodSlave1.StartActionLoop(t, wr)
 	defer goodSlave1.StopActionLoop(t)
 
-	goodSlave2.FakeMysqlDaemon.MasterAddr = newMaster.Tablet.MysqlIPAddr()
 	goodSlave2.StartActionLoop(t, wr)
 	defer goodSlave2.StopActionLoop(t)
 
 	// On the bad slave, we will respond to
-	// TABLET_ACTION_SLAVE_WAS_RESTARTED with bad data.
-	badSlave.FakeMysqlDaemon.MasterAddr = "234.0.0.1:3301"
+	// TabletActionSlaveWasRestarted with bad data.
 	badSlave.StartActionLoop(t, wr)
 	defer badSlave.StopActionLoop(t)
 
 	// First test: reparent to the same master, make sure it works
 	// as expected.
 	tmc := tmclient.NewTabletManagerClient()
-	ti, err := ts.GetTablet(oldMaster.Tablet.Alias)
+	ti, err := ts.GetTablet(ctx, oldMaster.Tablet.Alias)
 	if err != nil {
 		t.Fatalf("GetTablet failed: %v", err)
 	}
-	if err := tmc.TabletExternallyReparented(context.Background(), ti, ""); err != nil {
-		t.Fatalf("TabletExternallyReparented(same master) should have worked")
+	if err := vp.Run([]string{"TabletExternallyReparented", topoproto.TabletAliasString(oldMaster.Tablet.Alias)}); err != nil {
+		t.Fatalf("TabletExternallyReparented(same master) should have worked: %v", err)
 	}
 
 	// Second test: reparent to a replica, and pretend the old
@@ -139,242 +130,199 @@ func testTabletExternallyReparented(t *testing.T, fast bool) {
 
 	// This tests a bad case; the new designated master is a slave,
 	// but we should do what we're told anyway
-	ti, err = ts.GetTablet(goodSlave1.Tablet.Alias)
-	if err != nil {
-		t.Fatalf("GetTablet failed: %v", err)
-	}
-	if err := tmc.TabletExternallyReparented(context.Background(), ti, ""); err != nil {
-		t.Fatalf("TabletExternallyReparented(slave) error: %v", err)
-	}
-
-	// This tests the good case, where everything works as planned
-	t.Logf("TabletExternallyReparented(new master) expecting success")
-	ti, err = ts.GetTablet(newMaster.Tablet.Alias)
+	ti, err = ts.GetTablet(ctx, goodSlave1.Tablet.Alias)
 	if err != nil {
 		t.Fatalf("GetTablet failed: %v", err)
 	}
 	waitID := makeWaitID()
-	if err := tmc.TabletExternallyReparented(context.Background(), ti, waitID); err != nil {
+	if err := tmc.TabletExternallyReparented(context.Background(), ti.Tablet, waitID); err != nil {
+		t.Fatalf("TabletExternallyReparented(slave) error: %v", err)
+	}
+	waitForExternalReparent(t, waitID)
+
+	// This tests the good case, where everything works as planned
+	t.Logf("TabletExternallyReparented(new master) expecting success")
+	ti, err = ts.GetTablet(ctx, newMaster.Tablet.Alias)
+	if err != nil {
+		t.Fatalf("GetTablet failed: %v", err)
+	}
+	waitID = makeWaitID()
+	if err := tmc.TabletExternallyReparented(context.Background(), ti.Tablet, waitID); err != nil {
 		t.Fatalf("TabletExternallyReparented(replica) failed: %v", err)
 	}
-	if fast {
-		waitForExternalReparent(t, waitID)
-	}
-
-	// Now double-check the serving graph is good.
-	// Should only have one good replica left.
-	addrs, err := ts.GetEndPoints("cell1", "test_keyspace", "0", topo.TYPE_REPLICA)
-	if err != nil {
-		t.Fatalf("GetEndPoints failed at the end: %v", err)
-	}
-	if len(addrs.Entries) != 1 {
-		t.Fatalf("GetEndPoints has too many entries: %v", addrs)
-	}
+	waitForExternalReparent(t, waitID)
 }
 
 // TestTabletExternallyReparentedWithDifferentMysqlPort makes sure
 // that if mysql is restarted on the master-elect tablet and has a different
 // port, we pick it up correctly.
 func TestTabletExternallyReparentedWithDifferentMysqlPort(t *testing.T) {
-	testTabletExternallyReparentedWithDifferentMysqlPort(t, false /* fast */)
-}
+	tabletmanager.SetReparentFlags(time.Minute /* finalizeTimeout */)
 
-func TestTabletExternallyReparentedWithDifferentMysqlPortFast(t *testing.T) {
-	testTabletExternallyReparentedWithDifferentMysqlPort(t, true /* fast */)
-}
-
-func testTabletExternallyReparentedWithDifferentMysqlPort(t *testing.T, fast bool) {
-	tabletmanager.SetReparentFlags(fast, time.Minute /* finalizeTimeout */)
-
-	ts := zktopo.NewTestServer(t, []string{"cell1"})
-	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient(), time.Second)
+	ctx := context.Background()
+	db := fakesqldb.Register()
+	ts := zktestserver.New(t, []string{"cell1"})
+	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
 
 	// Create an old master, a new master, two good slaves, one bad slave
-	oldMaster := NewFakeTablet(t, wr, "cell1", 0, topo.TYPE_MASTER)
-	newMaster := NewFakeTablet(t, wr, "cell1", 1, topo.TYPE_REPLICA,
-		TabletParent(oldMaster.Tablet.Alias))
-	goodSlave := NewFakeTablet(t, wr, "cell1", 2, topo.TYPE_REPLICA,
-		TabletParent(oldMaster.Tablet.Alias))
+	oldMaster := NewFakeTablet(t, wr, "cell1", 0, topodatapb.TabletType_MASTER, db)
+	newMaster := NewFakeTablet(t, wr, "cell1", 1, topodatapb.TabletType_REPLICA, db)
+	goodSlave := NewFakeTablet(t, wr, "cell1", 2, topodatapb.TabletType_REPLICA, db)
 
 	// Now we're restarting mysql on a different port, 3301->3303
 	// but without updating the Tablet record in topology.
 
 	// On the elected master, we will respond to
-	// TABLET_ACTION_SLAVE_WAS_PROMOTED, so we need a MysqlDaemon
+	// TabletActionSlaveWasPromoted, so we need a MysqlDaemon
 	// that returns no master, and the new port (as returned by mysql)
-	newMaster.FakeMysqlDaemon.MasterAddr = ""
 	newMaster.FakeMysqlDaemon.MysqlPort = 3303
 	newMaster.StartActionLoop(t, wr)
 	defer newMaster.StopActionLoop(t)
 
 	// On the old master, we will only respond to
-	// TABLET_ACTION_SLAVE_WAS_RESTARTED and point to the new mysql port
-	oldMaster.FakeMysqlDaemon.MasterAddr = "101.0.0.1:3303"
+	// TabletActionSlaveWasRestarted and point to the new mysql port
 	oldMaster.StartActionLoop(t, wr)
 	defer oldMaster.StopActionLoop(t)
 
 	// On the good slaves, we will respond to
-	// TABLET_ACTION_SLAVE_WAS_RESTARTED and point to the new mysql port
-	goodSlave.FakeMysqlDaemon.MasterAddr = "101.0.0.1:3303"
+	// TabletActionSlaveWasRestarted and point to the new mysql port
 	goodSlave.StartActionLoop(t, wr)
 	defer goodSlave.StopActionLoop(t)
 
 	// This tests the good case, where everything works as planned
 	t.Logf("TabletExternallyReparented(new master) expecting success")
 	tmc := tmclient.NewTabletManagerClient()
-	ti, err := ts.GetTablet(newMaster.Tablet.Alias)
+	ti, err := ts.GetTablet(ctx, newMaster.Tablet.Alias)
 	if err != nil {
 		t.Fatalf("GetTablet failed: %v", err)
 	}
-	if err := tmc.TabletExternallyReparented(context.Background(), ti, ""); err != nil {
+	waitID := makeWaitID()
+	if err := tmc.TabletExternallyReparented(context.Background(), ti.Tablet, waitID); err != nil {
 		t.Fatalf("TabletExternallyReparented(replica) failed: %v", err)
 	}
+	waitForExternalReparent(t, waitID)
 }
 
 // TestTabletExternallyReparentedContinueOnUnexpectedMaster makes sure
 // that we ignore mysql's master if the flag is set
 func TestTabletExternallyReparentedContinueOnUnexpectedMaster(t *testing.T) {
-	testTabletExternallyReparentedContinueOnUnexpectedMaster(t, false /* fast */)
-}
+	tabletmanager.SetReparentFlags(time.Minute /* finalizeTimeout */)
 
-func TestTabletExternallyReparentedContinueOnUnexpectedMasterFast(t *testing.T) {
-	testTabletExternallyReparentedContinueOnUnexpectedMaster(t, true /* fast */)
-}
-
-func testTabletExternallyReparentedContinueOnUnexpectedMaster(t *testing.T, fast bool) {
-	tabletmanager.SetReparentFlags(fast, time.Minute /* finalizeTimeout */)
-
-	ts := zktopo.NewTestServer(t, []string{"cell1"})
-	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient(), time.Second)
+	ctx := context.Background()
+	db := fakesqldb.Register()
+	ts := zktestserver.New(t, []string{"cell1"})
+	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
 
 	// Create an old master, a new master, two good slaves, one bad slave
-	oldMaster := NewFakeTablet(t, wr, "cell1", 0, topo.TYPE_MASTER)
-	newMaster := NewFakeTablet(t, wr, "cell1", 1, topo.TYPE_REPLICA,
-		TabletParent(oldMaster.Tablet.Alias))
-	goodSlave := NewFakeTablet(t, wr, "cell1", 2, topo.TYPE_REPLICA,
-		TabletParent(oldMaster.Tablet.Alias))
+	oldMaster := NewFakeTablet(t, wr, "cell1", 0, topodatapb.TabletType_MASTER, db)
+	newMaster := NewFakeTablet(t, wr, "cell1", 1, topodatapb.TabletType_REPLICA, db)
+	goodSlave := NewFakeTablet(t, wr, "cell1", 2, topodatapb.TabletType_REPLICA, db)
 
 	// On the elected master, we will respond to
-	// TABLET_ACTION_SLAVE_WAS_PROMOTED, so we need a MysqlDaemon
+	// TabletActionSlaveWasPromoted, so we need a MysqlDaemon
 	// that returns no master, and the new port (as returned by mysql)
-	newMaster.FakeMysqlDaemon.MasterAddr = ""
 	newMaster.StartActionLoop(t, wr)
 	defer newMaster.StopActionLoop(t)
 
 	// On the old master, we will only respond to
-	// TABLET_ACTION_SLAVE_WAS_RESTARTED and point to a bad host
-	oldMaster.FakeMysqlDaemon.MasterAddr = "1.2.3.4:6666"
+	// TabletActionSlaveWasRestarted and point to a bad host
 	oldMaster.StartActionLoop(t, wr)
 	defer oldMaster.StopActionLoop(t)
 
 	// On the good slave, we will respond to
-	// TABLET_ACTION_SLAVE_WAS_RESTARTED and point to a bad host
-	goodSlave.FakeMysqlDaemon.MasterAddr = "1.2.3.4:6666"
+	// TabletActionSlaveWasRestarted and point to a bad host
 	goodSlave.StartActionLoop(t, wr)
 	defer goodSlave.StopActionLoop(t)
 
 	// This tests the good case, where everything works as planned
 	t.Logf("TabletExternallyReparented(new master) expecting success")
 	tmc := tmclient.NewTabletManagerClient()
-	ti, err := ts.GetTablet(newMaster.Tablet.Alias)
+	ti, err := ts.GetTablet(ctx, newMaster.Tablet.Alias)
 	if err != nil {
 		t.Fatalf("GetTablet failed: %v", err)
 	}
-	if err := tmc.TabletExternallyReparented(context.Background(), ti, ""); err != nil {
+	waitID := makeWaitID()
+	if err := tmc.TabletExternallyReparented(context.Background(), ti.Tablet, waitID); err != nil {
 		t.Fatalf("TabletExternallyReparented(replica) failed: %v", err)
 	}
+	waitForExternalReparent(t, waitID)
 }
 
 func TestTabletExternallyReparentedFailedOldMaster(t *testing.T) {
-	testTabletExternallyReparentedFailedOldMaster(t, false /* fast */)
-}
+	tabletmanager.SetReparentFlags(time.Minute /* finalizeTimeout */)
 
-func TestTabletExternallyReparentedFailedOldMasterFast(t *testing.T) {
-	testTabletExternallyReparentedFailedOldMaster(t, true /* fast */)
-}
-
-func testTabletExternallyReparentedFailedOldMaster(t *testing.T, fast bool) {
-	tabletmanager.SetReparentFlags(fast, time.Minute /* finalizeTimeout */)
-
-	ts := zktopo.NewTestServer(t, []string{"cell1", "cell2"})
-	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient(), time.Second)
+	ctx := context.Background()
+	db := fakesqldb.Register()
+	ts := zktestserver.New(t, []string{"cell1", "cell2"})
+	wr := wrangler.New(logutil.NewConsoleLogger(), ts, tmclient.NewTabletManagerClient())
 
 	// Create an old master, a new master, and a good slave.
-	oldMaster := NewFakeTablet(t, wr, "cell1", 0, topo.TYPE_MASTER)
-	newMaster := NewFakeTablet(t, wr, "cell1", 1, topo.TYPE_REPLICA,
-		TabletParent(oldMaster.Tablet.Alias))
-	goodSlave := NewFakeTablet(t, wr, "cell1", 2, topo.TYPE_REPLICA,
-		TabletParent(oldMaster.Tablet.Alias))
+	oldMaster := NewFakeTablet(t, wr, "cell1", 0, topodatapb.TabletType_MASTER, db)
+	newMaster := NewFakeTablet(t, wr, "cell1", 1, topodatapb.TabletType_REPLICA, db)
+	goodSlave := NewFakeTablet(t, wr, "cell1", 2, topodatapb.TabletType_REPLICA, db)
 
 	// Reparent to a replica, and pretend the old master is not responding.
 
 	// On the elected master, we will respond to
-	// TABLET_ACTION_SLAVE_WAS_PROMOTED
-	newMaster.FakeMysqlDaemon.MasterAddr = ""
+	// TabletActionSlaveWasPromoted
 	newMaster.StartActionLoop(t, wr)
 	defer newMaster.StopActionLoop(t)
 
 	// On the old master, we will only get a
-	// TABLET_ACTION_SLAVE_WAS_RESTARTED call, let's just not
+	// TabletActionSlaveWasRestarted call, let's just not
 	// respond to it at all
 
 	// On the good slave, we will respond to
-	// TABLET_ACTION_SLAVE_WAS_RESTARTED.
-	goodSlave.FakeMysqlDaemon.MasterAddr = newMaster.Tablet.MysqlIPAddr()
+	// TabletActionSlaveWasRestarted.
 	goodSlave.StartActionLoop(t, wr)
 	defer goodSlave.StopActionLoop(t)
 
 	// The reparent should work as expected here
 	t.Logf("TabletExternallyReparented(new master) expecting success")
 	tmc := tmclient.NewTabletManagerClient()
-	ti, err := ts.GetTablet(newMaster.Tablet.Alias)
+	ti, err := ts.GetTablet(ctx, newMaster.Tablet.Alias)
 	if err != nil {
 		t.Fatalf("GetTablet failed: %v", err)
 	}
 	waitID := makeWaitID()
-	if err := tmc.TabletExternallyReparented(context.Background(), ti, waitID); err != nil {
+	if err := tmc.TabletExternallyReparented(context.Background(), ti.Tablet, waitID); err != nil {
 		t.Fatalf("TabletExternallyReparented(replica) failed: %v", err)
 	}
-	if fast {
-		waitForExternalReparent(t, waitID)
-	}
+	waitForExternalReparent(t, waitID)
 
-	// Now double-check the serving graph is good.
-	// Should only have one good replica left.
-	addrs, err := ts.GetEndPoints("cell1", "test_keyspace", "0", topo.TYPE_REPLICA)
-	if err != nil {
-		t.Fatalf("GetEndPoints failed at the end: %v", err)
-	}
-	if len(addrs.Entries) != 1 {
-		t.Fatalf("GetEndPoints has too many entries: %v", addrs)
-	}
-
-	// check the old master was converted to spare
-	tablet, err := ts.GetTablet(oldMaster.Tablet.Alias)
+	// check the old master was converted to replica
+	tablet, err := ts.GetTablet(ctx, oldMaster.Tablet.Alias)
 	if err != nil {
 		t.Fatalf("GetTablet(%v) failed: %v", oldMaster.Tablet.Alias, err)
 	}
-	if tablet.Type != topo.TYPE_SPARE {
+	if tablet.Type != topodatapb.TabletType_REPLICA {
 		t.Fatalf("old master should be spare but is: %v", tablet.Type)
 	}
 }
 
-var externalReparents = make(map[string]chan struct{})
+var (
+	externalReparents      = make(map[string]chan struct{})
+	externalReparentsMutex sync.Mutex
+)
 
 // makeWaitID generates a unique externalID that can be passed to
 // TabletExternallyReparented, and then to waitForExternalReparent.
 func makeWaitID() string {
+	externalReparentsMutex.Lock()
 	id := fmt.Sprintf("wait id %v", len(externalReparents))
 	externalReparents[id] = make(chan struct{})
+	externalReparentsMutex.Unlock()
 	return id
 }
 
 func init() {
 	event.AddListener(func(ev *events.Reparent) {
 		if ev.Status == "finished" {
+			externalReparentsMutex.Lock()
 			if c, ok := externalReparents[ev.ExternalID]; ok {
 				close(c)
 			}
+			externalReparentsMutex.Unlock()
 		}
 	})
 }
@@ -383,7 +331,7 @@ func init() {
 // reparent with the given ID to finish. The ID must have been previously
 // generated by makeWaitID().
 //
-// In fast mode, the TabletExternallyReparented RPC returns as soon as the
+// The TabletExternallyReparented RPC returns as soon as the
 // new master is visible in the serving graph. Before checking things like
 // replica endpoints and old master status, we should wait for the finalize
 // stage, which happens in the background.
@@ -391,8 +339,12 @@ func waitForExternalReparent(t *testing.T, externalID string) {
 	timer := time.NewTimer(10 * time.Second)
 	defer timer.Stop()
 
+	externalReparentsMutex.Lock()
+	c := externalReparents[externalID]
+	externalReparentsMutex.Unlock()
+
 	select {
-	case <-externalReparents[externalID]:
+	case <-c:
 		return
 	case <-timer.C:
 		t.Fatalf("deadline exceeded waiting for finalized external reparent %q", externalID)

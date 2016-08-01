@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/youtube/vitess/go/mysql/proto"
 	"github.com/youtube/vitess/go/sqldb"
 	"github.com/youtube/vitess/go/sqltypes"
 	"github.com/youtube/vitess/go/stats"
@@ -25,7 +24,7 @@ type DBConnection struct {
 }
 
 func (dbc *DBConnection) handleError(err error) {
-	if sqlErr, ok := err.(*sqldb.SqlError); ok {
+	if sqlErr, ok := err.(*sqldb.SQLError); ok {
 		if sqlErr.Number() >= 2000 && sqlErr.Number() <= 2018 { // mysql connection errors
 			dbc.Close()
 		}
@@ -36,7 +35,7 @@ func (dbc *DBConnection) handleError(err error) {
 }
 
 // ExecuteFetch is part of PoolConnection interface.
-func (dbc *DBConnection) ExecuteFetch(query string, maxrows int, wantfields bool) (*proto.QueryResult, error) {
+func (dbc *DBConnection) ExecuteFetch(query string, maxrows int, wantfields bool) (*sqltypes.Result, error) {
 	defer dbc.mysqlStats.Record("Exec", time.Now())
 	mqr, err := dbc.Conn.ExecuteFetch(query, maxrows, wantfields)
 	if err != nil {
@@ -47,7 +46,7 @@ func (dbc *DBConnection) ExecuteFetch(query string, maxrows int, wantfields bool
 }
 
 // ExecuteStreamFetch is part of PoolConnection interface.
-func (dbc *DBConnection) ExecuteStreamFetch(query string, callback func(*proto.QueryResult) error, streamBufferSize int) error {
+func (dbc *DBConnection) ExecuteStreamFetch(query string, callback func(*sqltypes.Result) error, streamBufferSize int) error {
 	defer dbc.mysqlStats.Record("ExecStream", time.Now())
 
 	err := dbc.Conn.ExecuteStreamFetch(query)
@@ -58,14 +57,18 @@ func (dbc *DBConnection) ExecuteStreamFetch(query string, callback func(*proto.Q
 	defer dbc.CloseResult()
 
 	// first call the callback with the fields
-	err = callback(&proto.QueryResult{Fields: dbc.Fields()})
+	flds, err := dbc.Fields()
+	if err != nil {
+		return err
+	}
+	err = callback(&sqltypes.Result{Fields: flds})
 	if err != nil {
 		return fmt.Errorf("stream send error: %v", err)
 	}
 
 	// then get all the rows, sending them as we reach a decent packet size
 	// start with a pre-allocated array of 256 rows capacity
-	qr := &proto.QueryResult{Rows: make([][]sqltypes.Value, 0, 256)}
+	qr := &sqltypes.Result{Rows: make([][]sqltypes.Value, 0, 256)}
 	byteCount := 0
 	for {
 		row, err := dbc.FetchNext()
@@ -77,7 +80,7 @@ func (dbc *DBConnection) ExecuteStreamFetch(query string, callback func(*proto.Q
 		}
 		qr.Rows = append(qr.Rows, row)
 		for _, s := range row {
-			byteCount += len(s.Raw())
+			byteCount += s.Len()
 		}
 
 		if byteCount >= streamBufferSize {
@@ -102,19 +105,35 @@ func (dbc *DBConnection) ExecuteStreamFetch(query string, callback func(*proto.Q
 	return nil
 }
 
-var getModeSql = "select @@global.sql_mode"
+var (
+	getModeSQL    = "select @@global.sql_mode"
+	getAutocommit = "select @@autocommit"
+)
 
-// VerifyStrict is a helper method to verify mysql is running with
-// sql_mode = STRICT_TRANS_TABLES.
-func (dbc *DBConnection) VerifyStrict() bool {
-	qr, err := dbc.ExecuteFetch(getModeSql, 2, false)
+// VerifyMode is a helper method to verify mysql is running with
+// sql_mode = STRICT_TRANS_TABLES and autocommit=ON.
+func (dbc *DBConnection) VerifyMode() error {
+	qr, err := dbc.ExecuteFetch(getModeSQL, 2, false)
 	if err != nil {
-		return false
+		return fmt.Errorf("could not verify mode: %v", err)
 	}
-	if len(qr.Rows) == 0 {
-		return false
+	if len(qr.Rows) != 1 {
+		return fmt.Errorf("incorrect rowcount received for %s: %d", getModeSQL, len(qr.Rows))
 	}
-	return strings.Contains(qr.Rows[0][0].String(), "STRICT_TRANS_TABLES")
+	if !strings.Contains(qr.Rows[0][0].String(), "STRICT_TRANS_TABLES") {
+		return fmt.Errorf("require sql_mode to be STRICT_TRANS_TABLES: got %s", qr.Rows[0][0].String())
+	}
+	qr, err = dbc.ExecuteFetch(getAutocommit, 2, false)
+	if err != nil {
+		return fmt.Errorf("could not verify mode: %v", err)
+	}
+	if len(qr.Rows) != 1 {
+		return fmt.Errorf("incorrect rowcount received for %s: %d", getAutocommit, len(qr.Rows))
+	}
+	if !strings.Contains(qr.Rows[0][0].String(), "1") {
+		return fmt.Errorf("require autocommit to be 1: got %s", qr.Rows[0][0].String())
+	}
+	return nil
 }
 
 // NewDBConnection returns a new DBConnection based on the ConnParams

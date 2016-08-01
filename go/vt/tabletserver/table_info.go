@@ -8,27 +8,36 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
 	log "github.com/golang/glog"
-	"github.com/youtube/vitess/go/sqltypes"
-	"github.com/youtube/vitess/go/sync2"
+	querypb "github.com/youtube/vitess/go/vt/proto/query"
 	"github.com/youtube/vitess/go/vt/schema"
 	"golang.org/x/net/context"
 )
 
+// TableInfo contains the tabletserver related info for a table.
+// It's a superset of schema.Table.
 type TableInfo struct {
 	*schema.Table
-	Cache *RowCache
-	// stats updated by sqlquery.go
-	hits, absent, misses, invalidations sync2.AtomicInt64
+
+	// Seq must be locked before accessing the sequence vars.
+	// If CurVal==LastVal, we have to cache new values.
+	Seq       sync.Mutex
+	NextVal   int64
+	Increment int64
+	LastVal   int64
 }
 
-func NewTableInfo(conn *DBConn, tableName string, tableType string, createTime sqltypes.Value, comment string, cachePool *CachePool) (ti *TableInfo, err error) {
+// NewTableInfo creates a new TableInfo.
+func NewTableInfo(conn *DBConn, tableName string, tableType string, comment string) (ti *TableInfo, err error) {
 	ti, err = loadTableInfo(conn, tableName)
 	if err != nil {
 		return nil, err
 	}
-	ti.initRowCache(conn, tableType, createTime, comment, cachePool)
+	if strings.Contains(comment, "vitess_sequence") {
+		ti.Type = schema.Sequence
+	}
 	return ti, nil
 }
 
@@ -44,16 +53,31 @@ func loadTableInfo(conn *DBConn, tableName string) (ti *TableInfo, err error) {
 }
 
 func (ti *TableInfo) fetchColumns(conn *DBConn) error {
+	qr, err := conn.Exec(context.Background(), fmt.Sprintf("select * from `%s` where 1 != 1", ti.Name), 10000, true)
+	if err != nil {
+		return err
+	}
+	fieldTypes := make(map[string]querypb.Type, len(qr.Fields))
+	for _, field := range qr.Fields {
+		fieldTypes[field.Name] = field.Type
+	}
 	columns, err := conn.Exec(context.Background(), fmt.Sprintf("describe `%s`", ti.Name), 10000, false)
 	if err != nil {
 		return err
 	}
 	for _, row := range columns.Rows {
-		ti.AddColumn(row[0].String(), row[1].String(), row[4], row[5].String())
+		name := row[0].String()
+		columnType, ok := fieldTypes[name]
+		if !ok {
+			log.Warningf("Table: %s, column %s not found in select list, skipping.", ti.Name, name)
+			continue
+		}
+		ti.AddColumn(name, columnType, row[4], row[5].String())
 	}
 	return nil
 }
 
+// SetPK sets the pk columns for a TableInfo.
 func (ti *TableInfo) SetPK(colnames []string) error {
 	pkIndex := schema.NewIndex("PRIMARY")
 	colnums := make([]int, len(colnames))
@@ -69,7 +93,7 @@ func (ti *TableInfo) SetPK(colnames []string) error {
 	}
 	if len(ti.Indexes) == 0 {
 		ti.Indexes = make([]*schema.Index, 1)
-	} else if ti.Indexes[0].Name != "PRIMARY" {
+	} else if ti.Indexes[0].Name.Lowered() != "primary" {
 		ti.Indexes = append(ti.Indexes, nil)
 		copy(ti.Indexes[1:], ti.Indexes[:len(ti.Indexes)-1])
 	} // else we replace the currunt primary key
@@ -104,12 +128,12 @@ func (ti *TableInfo) fetchIndexes(conn *DBConn) error {
 		return nil
 	}
 	pkIndex := ti.Indexes[0]
-	if pkIndex.Name != "PRIMARY" {
+	if pkIndex.Name.Lowered() != "primary" {
 		return nil
 	}
 	ti.PKColumns = make([]int, len(pkIndex.Columns))
 	for i, pkCol := range pkIndex.Columns {
-		ti.PKColumns[i] = ti.FindColumn(pkCol)
+		ti.PKColumns[i] = ti.FindColumn(pkCol.Original())
 	}
 	// Primary key contains all table columns
 	for _, col := range ti.Columns {
@@ -123,53 +147,11 @@ func (ti *TableInfo) fetchIndexes(conn *DBConn) error {
 		for _, c := range pkIndex.Columns {
 			// pk columns may already be part of the index. So,
 			// check before adding.
-			if ti.Indexes[i].FindDataColumn(c) != -1 {
+			if ti.Indexes[i].FindDataColumn(c.Original()) != -1 {
 				continue
 			}
 			ti.Indexes[i].DataColumns = append(ti.Indexes[i].DataColumns, c)
 		}
 	}
 	return nil
-}
-
-func (ti *TableInfo) initRowCache(conn *DBConn, tableType string, createTime sqltypes.Value, comment string, cachePool *CachePool) {
-	if cachePool.IsClosed() {
-		return
-	}
-
-	if strings.Contains(comment, "vtocc_nocache") {
-		log.Infof("%s commented as vtocc_nocache. Will not be cached.", ti.Name)
-		return
-	}
-
-	if tableType == "VIEW" {
-		log.Infof("%s is a view. Will not be cached.", ti.Name)
-		return
-	}
-
-	if ti.PKColumns == nil {
-		log.Infof("Table %s has no primary key. Will not be cached.", ti.Name)
-		return
-	}
-	for _, col := range ti.PKColumns {
-		if ti.Columns[col].Category == schema.CAT_OTHER {
-			log.Infof("Table %s pk has unsupported column types. Will not be cached.", ti.Name)
-			return
-		}
-	}
-
-	ti.CacheType = schema.CACHE_RW
-	ti.Cache = NewRowCache(ti, cachePool)
-}
-
-func (ti *TableInfo) StatsJSON() string {
-	if ti.Cache == nil {
-		return fmt.Sprintf("null")
-	}
-	h, a, m, i := ti.Stats()
-	return fmt.Sprintf("{\"Hits\": %v, \"Absent\": %v, \"Misses\": %v, \"Invalidations\": %v}", h, a, m, i)
-}
-
-func (ti *TableInfo) Stats() (hits, absent, misses, invalidations int64) {
-	return ti.hits.Get(), ti.absent.Get(), ti.misses.Get(), ti.invalidations.Get()
 }

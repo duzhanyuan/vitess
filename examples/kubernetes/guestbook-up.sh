@@ -1,14 +1,16 @@
 #!/bin/bash
 
-# This is an example script that starts a guestbook replicationController.
+# This is an example script that starts a guestbook replicationcontroller.
 
 set -e
 
 script_root=`dirname "${BASH_SOURCE}"`
 source $script_root/env.sh
 
-echo "Creating guestbook service..."
-$KUBECTL create -f guestbook-service.yaml
+VITESS_NAME=${VITESS_NAME:-'default'}
 
-echo "Creating guestbook replicationController..."
-$KUBECTL create -f guestbook-controller.yaml
+echo "Creating guestbook service..."
+$KUBECTL create --namespace=$VITESS_NAME -f guestbook-service.yaml
+
+echo "Creating guestbook replicationcontroller..."
+$KUBECTL create --namespace=$VITESS_NAME -f guestbook-controller.yaml

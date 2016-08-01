@@ -9,26 +9,28 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/youtube/vitess/go/mysql/proto"
 	"github.com/youtube/vitess/go/sqltypes"
+
+	binlogdatapb "github.com/youtube/vitess/go/vt/proto/binlogdata"
+	querypb "github.com/youtube/vitess/go/vt/proto/query"
 )
 
 // NewConnFunc is a factory method that creates a Conn instance
 // using given ConnParams.
 type NewConnFunc func(params ConnParams) (Conn, error)
 
-// conns stores all supported db connection.
-var conns = make(map[string]NewConnFunc)
+var (
+	defaultConn NewConnFunc
 
-var mu sync.Mutex
-
-// DefaultDB decides the default db connection.
-var DefaultDB string
+	// mu protects conns.
+	mu    sync.Mutex
+	conns = make(map[string]NewConnFunc)
+)
 
 // Conn defines the behavior for the low level db connection
 type Conn interface {
 	// ExecuteFetch executes the query on the connection
-	ExecuteFetch(query string, maxrows int, wantfields bool) (*proto.QueryResult, error)
+	ExecuteFetch(query string, maxrows int, wantfields bool) (*sqltypes.Result, error)
 	// ExecuteFetchMap returns a map from column names to cell data for a query
 	// that should return exactly 1 row.
 	ExecuteFetchMap(query string) (map[string]string, error)
@@ -45,7 +47,7 @@ type Conn interface {
 	// a connection to stop ongoing communication.
 	Shutdown()
 	// Fields returns the current fields description for the query
-	Fields() []proto.Field
+	Fields() ([]*querypb.Field, error)
 	// ID returns the connection id.
 	ID() int64
 	// FetchNext returns the next row for a query
@@ -56,12 +58,21 @@ type Conn interface {
 	SendCommand(command uint32, data []byte) error
 	// GetCharset returns the current numerical values of the per-session character
 	// set variables.
-	GetCharset() (cs proto.Charset, err error)
+	GetCharset() (cs *binlogdatapb.Charset, err error)
 	// SetCharset changes the per-session character set variables.
-	SetCharset(cs proto.Charset) error
+	SetCharset(cs *binlogdatapb.Charset) error
 }
 
-// Register a db connection.
+// RegisterDefault registers the default connection function.
+// Only one default can be registered.
+func RegisterDefault(fn NewConnFunc) {
+	if defaultConn != nil {
+		panic("default connection initialized more than once")
+	}
+	defaultConn = fn
+}
+
+// Register registers a db connection.
 func Register(name string, fn NewConnFunc) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -73,20 +84,15 @@ func Register(name string, fn NewConnFunc) {
 
 // Connect returns a sqldb.Conn using the default connection creation function.
 func Connect(params ConnParams) (Conn, error) {
+	// Use a lock-free fast path for default.
+	if params.Engine == "" {
+		return defaultConn(params)
+	}
 	mu.Lock()
 	defer mu.Unlock()
-	if DefaultDB == "" {
-		if len(conns) == 1 {
-			for _, fn := range conns {
-				return fn(params)
-			}
-		}
-		panic("there are more than one conn func " +
-			"registered but no default db has been given.")
-	}
-	fn, ok := conns[DefaultDB]
+	fn, ok := conns[params.Engine]
 	if !ok {
-		panic(fmt.Sprintf("connection function for given default db: %s is not found.", DefaultDB))
+		panic(fmt.Sprintf("connection function not found for engine: %s", params.Engine))
 	}
 	return fn(params)
 }

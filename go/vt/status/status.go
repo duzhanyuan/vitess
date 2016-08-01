@@ -14,12 +14,10 @@ import (
 	"strings"
 
 	"github.com/youtube/vitess/go/vt/servenv"
-	"github.com/youtube/vitess/go/vt/topo"
 )
 
 var (
 	vtctldAddr = flag.String("vtctld_addr", "", "address of a vtctld instance")
-	_          = flag.String("vtctld_topo_explorer", "", "this flag is no longer used")
 )
 
 // MakeVtctldRedirect returns an absolute vtctld url that will
@@ -86,32 +84,6 @@ func VtctldSrvKeyspace(cell, keyspace string) template.HTML {
 	})
 }
 
-// VtctldSrvShard returns the shard name, possibly linked to the
-// SrvShard page in vtctld.
-func VtctldSrvShard(cell, keyspace, shard string) template.HTML {
-	return MakeVtctldRedirect(shard, map[string]string{
-		"type":     "srv_shard",
-		"cell":     cell,
-		"keyspace": keyspace,
-		"shard":    shard,
-	})
-}
-
-// VtctldSrvType returns the tablet type, possibly linked to the
-// EndPoints page in vtctld.
-func VtctldSrvType(cell, keyspace, shard string, tabletType topo.TabletType) template.HTML {
-	if !topo.IsInServingGraph(tabletType) {
-		return template.HTML(tabletType)
-	}
-	return MakeVtctldRedirect(string(tabletType), map[string]string{
-		"type":        "srv_type",
-		"cell":        cell,
-		"keyspace":    keyspace,
-		"shard":       shard,
-		"tablet_type": string(tabletType),
-	})
-}
-
 // VtctldReplication returns 'cell/keyspace/shard', possibly linked to the
 // ShardReplication page in vtctld.
 func VtctldReplication(cell, keyspace, shard string) template.HTML {
@@ -133,15 +105,17 @@ func VtctldTablet(aliasName string) template.HTML {
 	})
 }
 
+// StatusFuncs returns a FuncMap that contains all of our methods here.
+// It is exported so tests can use them.
+var StatusFuncs = template.FuncMap{
+	"github_com_youtube_vitess_vtctld_keyspace":     VtctldKeyspace,
+	"github_com_youtube_vitess_vtctld_shard":        VtctldShard,
+	"github_com_youtube_vitess_vtctld_srv_cell":     VtctldSrvCell,
+	"github_com_youtube_vitess_vtctld_srv_keyspace": VtctldSrvKeyspace,
+	"github_com_youtube_vitess_vtctld_replication":  VtctldReplication,
+	"github_com_youtube_vitess_vtctld_tablet":       VtctldTablet,
+}
+
 func init() {
-	servenv.AddStatusFuncs(template.FuncMap{
-		"github_com_youtube_vitess_vtctld_keyspace":     VtctldKeyspace,
-		"github_com_youtube_vitess_vtctld_shard":        VtctldShard,
-		"github_com_youtube_vitess_vtctld_srv_cell":     VtctldSrvCell,
-		"github_com_youtube_vitess_vtctld_srv_keyspace": VtctldSrvKeyspace,
-		"github_com_youtube_vitess_vtctld_srv_shard":    VtctldSrvShard,
-		"github_com_youtube_vitess_vtctld_srv_type":     VtctldSrvType,
-		"github_com_youtube_vitess_vtctld_replication":  VtctldReplication,
-		"github_com_youtube_vitess_vtctld_tablet":       VtctldTablet,
-	})
+	servenv.AddStatusFuncs(StatusFuncs)
 }

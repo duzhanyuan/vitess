@@ -10,71 +10,72 @@ import (
 	"path"
 	"sort"
 
-	"github.com/youtube/vitess/go/event"
-	"github.com/youtube/vitess/go/jscfg"
+	zookeeper "github.com/samuel/go-zookeeper/zk"
+	"golang.org/x/net/context"
+
 	"github.com/youtube/vitess/go/vt/topo"
-	"github.com/youtube/vitess/go/vt/topo/events"
 	"github.com/youtube/vitess/go/zk"
-	"launchpad.net/gozk/zookeeper"
+
+	topodatapb "github.com/youtube/vitess/go/vt/proto/topodata"
 )
 
 /*
 This file contains the shard management code for zktopo.Server
 */
 
-func (zkts *Server) CreateShard(keyspace, shard string, value *topo.Shard) error {
-	shardPath := path.Join(globalKeyspacesPath, keyspace, "shards", shard)
+// CreateShard is part of the topo.Server interface
+func (zkts *Server) CreateShard(ctx context.Context, keyspace, shard string, value *topodatapb.Shard) error {
+	shardPath := path.Join(GlobalKeyspacesPath, keyspace, "shards", shard)
 	pathList := []string{
 		shardPath,
 		path.Join(shardPath, "action"),
 		path.Join(shardPath, "actionlog"),
 	}
 
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+
 	alreadyExists := false
 	for i, zkPath := range pathList {
 		c := ""
 		if i == 0 {
-			c = jscfg.ToJson(value)
+			c = string(data)
 		}
-		_, err := zk.CreateRecursive(zkts.zconn, zkPath, c, 0, zookeeper.WorldACL(zookeeper.PERM_ALL))
-		if err != nil {
-			if zookeeper.IsError(err, zookeeper.ZNODEEXISTS) {
-				alreadyExists = true
-			} else {
-				return fmt.Errorf("error creating shard: %v %v", zkPath, err)
-			}
+		_, err := zk.CreateRecursive(zkts.zconn, zkPath, c, 0, zookeeper.WorldACL(zookeeper.PermAll))
+		switch err {
+		case nil:
+			// nothing to do
+		case zookeeper.ErrNodeExists:
+			alreadyExists = true
+		default:
+			return convertError(err)
 		}
 	}
 	if alreadyExists {
 		return topo.ErrNodeExists
 	}
-
-	event.Dispatch(&events.ShardChange{
-		ShardInfo: *topo.NewShardInfo(keyspace, shard, value, -1),
-		Status:    "created",
-	})
 	return nil
 }
 
-func (zkts *Server) UpdateShard(si *topo.ShardInfo, existingVersion int64) (int64, error) {
-	shardPath := path.Join(globalKeyspacesPath, si.Keyspace(), "shards", si.ShardName())
-	stat, err := zkts.zconn.Set(shardPath, jscfg.ToJson(si.Shard), int(existingVersion))
+// UpdateShard is part of the topo.Server interface
+func (zkts *Server) UpdateShard(ctx context.Context, keyspace, shard string, value *topodatapb.Shard, existingVersion int64) (int64, error) {
+	shardPath := path.Join(GlobalKeyspacesPath, keyspace, "shards", shard)
+	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
-		if zookeeper.IsError(err, zookeeper.ZNONODE) {
-			err = topo.ErrNoNode
-		}
 		return -1, err
 	}
-
-	event.Dispatch(&events.ShardChange{
-		ShardInfo: *si,
-		Status:    "updated",
-	})
-	return int64(stat.Version()), nil
+	stat, err := zkts.zconn.Set(shardPath, string(data), int32(existingVersion))
+	if err != nil {
+		return -1, convertError(err)
+	}
+	return int64(stat.Version), nil
 }
 
-func (zkts *Server) ValidateShard(keyspace, shard string) error {
-	shardPath := path.Join(globalKeyspacesPath, keyspace, "shards", shard)
+// ValidateShard is part of the topo.Server interface
+func (zkts *Server) ValidateShard(ctx context.Context, keyspace, shard string) error {
+	shardPath := path.Join(GlobalKeyspacesPath, keyspace, "shards", shard)
 	zkPaths := []string{
 		path.Join(shardPath, "action"),
 		path.Join(shardPath, "actionlog"),
@@ -82,57 +83,46 @@ func (zkts *Server) ValidateShard(keyspace, shard string) error {
 	for _, zkPath := range zkPaths {
 		_, _, err := zkts.zconn.Get(zkPath)
 		if err != nil {
-			return err
+			return convertError(err)
 		}
 	}
 	return nil
 }
 
-func (zkts *Server) GetShard(keyspace, shard string) (*topo.ShardInfo, error) {
-	shardPath := path.Join(globalKeyspacesPath, keyspace, "shards", shard)
+// GetShard is part of the topo.Server interface
+func (zkts *Server) GetShard(ctx context.Context, keyspace, shard string) (*topodatapb.Shard, int64, error) {
+	shardPath := path.Join(GlobalKeyspacesPath, keyspace, "shards", shard)
 	data, stat, err := zkts.zconn.Get(shardPath)
 	if err != nil {
-		if zookeeper.IsError(err, zookeeper.ZNONODE) {
-			err = topo.ErrNoNode
-		}
-		return nil, err
+		return nil, 0, convertError(err)
 	}
 
-	s := &topo.Shard{}
+	s := &topodatapb.Shard{}
 	if err = json.Unmarshal([]byte(data), s); err != nil {
-		return nil, fmt.Errorf("bad shard data %v", err)
+		return nil, 0, fmt.Errorf("bad shard data %v", err)
 	}
 
-	return topo.NewShardInfo(keyspace, shard, s, int64(stat.Version())), nil
+	return s, int64(stat.Version), nil
 }
 
-func (zkts *Server) GetShardNames(keyspace string) ([]string, error) {
-	shardsPath := path.Join(globalKeyspacesPath, keyspace, "shards")
+// GetShardNames is part of the topo.Server interface
+func (zkts *Server) GetShardNames(ctx context.Context, keyspace string) ([]string, error) {
+	shardsPath := path.Join(GlobalKeyspacesPath, keyspace, "shards")
 	children, _, err := zkts.zconn.Children(shardsPath)
 	if err != nil {
-		if zookeeper.IsError(err, zookeeper.ZNONODE) {
-			err = topo.ErrNoNode
-		}
-		return nil, err
+		return nil, convertError(err)
 	}
 
 	sort.Strings(children)
 	return children, nil
 }
 
-func (zkts *Server) DeleteShard(keyspace, shard string) error {
-	shardPath := path.Join(globalKeyspacesPath, keyspace, "shards", shard)
+// DeleteShard is part of the topo.Server interface
+func (zkts *Server) DeleteShard(ctx context.Context, keyspace, shard string) error {
+	shardPath := path.Join(GlobalKeyspacesPath, keyspace, "shards", shard)
 	err := zk.DeleteRecursive(zkts.zconn, shardPath, -1)
 	if err != nil {
-		if zookeeper.IsError(err, zookeeper.ZNONODE) {
-			err = topo.ErrNoNode
-		}
-		return err
+		return convertError(err)
 	}
-
-	event.Dispatch(&events.ShardChange{
-		ShardInfo: *topo.NewShardInfo(keyspace, shard, nil, -1),
-		Status:    "deleted",
-	})
 	return nil
 }
